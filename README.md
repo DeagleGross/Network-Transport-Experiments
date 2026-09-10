@@ -123,29 +123,29 @@ Ordinary applications should continue to use `TcpClient`, `Socket`, `NetworkStre
 
 ```mermaid
 flowchart TD
-    subgraph ConsumerLayer["Consumer and adapter layer"]
-        App[Server framework or client library]
-        Pipe[System.IO.Pipelines adapter]
+    subgraph ConsumerLayer["Consumer / adapter"]
+        App["App or framework<br/>consumer code"]
+        Pipe["Pipelines adapter<br/>proposed API<br/>System.Net.Transport.Pipelines<br/>new Transport.Pipelines.dll"]
     end
 
-    subgraph ConnectionLayer["TransportConnection and lifecycle layer"]
-        Core[System.Net.Transport contracts]
+    subgraph ConnectionLayer["Connection / lifecycle"]
+        Core["Transport contracts<br/>proposed API<br/>System.Net.Transport<br/>System.Net.Security.dll"]
     end
 
-    subgraph ProviderLayer["Transport provider layer"]
-        SocketProvider[Managed Socket provider]
-        EpollProvider[Linux epoll provider]
-        UringProvider[Linux io_uring provider]
-        IocpProvider[Windows IOCP provider]
-        RioProvider[Windows RIO provider]
+    subgraph ProviderLayer["Providers"]
+        SocketProvider["Managed Socket<br/>proposed provider API<br/>System.Net.Transport.Sockets<br/>System.Net.Security.dll"]
+        EpollProvider["Linux epoll<br/>proposed provider API<br/>System.Net.Transport.Linux<br/>System.Net.Security.dll"]
+        UringProvider["Linux io_uring<br/>proposed provider API<br/>System.Net.Transport.Linux<br/>System.Net.Security.dll"]
+        IocpProvider["Windows IOCP<br/>proposed provider API<br/>System.Net.Transport.Windows<br/>System.Net.Security.dll"]
+        RioProvider["Windows RIO<br/>API shape TBD<br/>System.Net.Transport.Windows<br/>System.Net.Security.dll"]
     end
 
-    subgraph TlsImplementationLayer["TLS implementation and offload layer"]
-        Ssl[SslStream fallback TLS]
-        FdTls[fd-bound OpenSSL TLS]
-        BioTls[memory-BIO OpenSSL TLS]
-        Schannel[Schannel token TLS]
-        Ktls[kTLS TX/RX transition]
+    subgraph TlsImplementationLayer["TLS / offload"]
+        Ssl["SslStream fallback<br/>existing public type<br/>System.Net.Security.SslStream<br/>System.Net.Security.dll"]
+        FdTls["fd-bound OpenSSL<br/>internal implementation<br/>no public type<br/>System.Net.Security.dll"]
+        BioTls["memory-BIO OpenSSL<br/>internal implementation<br/>no public type<br/>System.Net.Security.dll"]
+        Schannel["Schannel tokens<br/>internal PAL<br/>no public type<br/>System.Net.Security.dll"]
+        Ktls["kTLS TX / RX<br/>internal implementation<br/>public result via TlsInfo<br/>System.Net.Security.dll"]
     end
 
     App --> Core
@@ -164,7 +164,41 @@ flowchart TD
     IocpProvider --> Schannel
     RioProvider --> Schannel
     FdTls --> Ktls
+
+    classDef consumer fill:#e8f4ff,stroke:#1976d2,color:#111
+    classDef existingAssembly fill:#e8f5e9,stroke:#2e7d32,color:#111
+    classDef newAssembly fill:#fff8e1,stroke:#f9a825,color:#111
+    classDef existingAssemblyTbd fill:#e8f5e9,stroke:#2e7d32,stroke-dasharray: 5 5,color:#111
+
+    class App consumer
+    class Pipe newAssembly
+    class Core,SocketProvider,EpollProvider,UringProvider,IocpProvider,Ssl,FdTls,BioTls,Schannel,Ktls existingAssembly
+    class RioProvider existingAssemblyTbd
 ```
+
+Diagram colors describe **assembly placement**, not API maturity: green means the code would live in the existing `System.Net.Security.dll`, yellow means a proposed new assembly, blue means code outside this runtime component, and dashed green means the API shape is still undecided inside an existing assembly.
+
+### API and assembly placement
+
+The assembly placement below is an incubation recommendation, not an approved runtime layout. In particular, namespace and assembly name do not need to match.
+
+| Diagram block | Visibility | Namespace or type | Incubation assembly | Meaning |
+|---|---|---|---|---|
+| Server framework or client library | Consumer code | Application, Kestrel, Redis client, or another library | Outside this runtime component | Calls either the low-level contract or an adapter |
+| System.IO.Pipelines adapter | Proposed public experimental API | `System.Net.Transport.Pipelines` | Candidate `System.Net.Transport.Pipelines.dll` | Converts the low-level transport model into `IDuplexPipe`; not part of a backend |
+| System.Net.Transport contracts | Proposed public experimental API | `System.Net.Transport` | Initially `System.Net.Security.dll` | Provider, listener, connection, callback, and result contracts under discussion |
+| Managed Socket provider | Proposed public experimental provider facade | `System.Net.Transport.Sockets.SocketTransportProvider` | Initially `System.Net.Security.dll` | Public provider selection/configuration surface; its SAEA/Socket machinery remains internal |
+| Linux epoll provider | Proposed public experimental provider facade | `System.Net.Transport.Linux.EpollTransportProvider` | Initially `System.Net.Security.dll` | Public provider selection/configuration surface; epoll loop, fd tables, events, and buffers remain internal |
+| Linux io_uring provider | Proposed public experimental provider facade | `System.Net.Transport.Linux.IoUringTransportProvider` | Initially `System.Net.Security.dll` | Public provider selection/configuration surface; SQEs, CQEs, rings, buffer IDs, and cancellation state remain internal |
+| Windows IOCP provider | Proposed public experimental provider facade | `System.Net.Transport.Windows.IocpTransportProvider` | Initially `System.Net.Security.dll` | Public provider selection/configuration surface; completion ports, OVERLAPPED blocks, and Winsock calls remain internal |
+| Windows RIO provider | Architecture candidate; public shape not yet proposed | Candidate `System.Net.Transport.Windows` type | Initially `System.Net.Security.dll` | RIO should be selectable for experiments, but its public type/options still need design |
+| SslStream fallback TLS | Existing public API, internally composed by the provider | `System.Net.Security.SslStream` | `System.Net.Security.dll` | Exact compatibility implementation for existing TLS semantics |
+| fd-bound OpenSSL TLS | Internal only | Internal runtime type and OpenSSL interop | `System.Net.Security.dll` | Provider implementation strategy; not a public TLS class or a second `SslStream` |
+| memory-BIO OpenSSL TLS | Internal only | Existing/evolved runtime OpenSSL PAL internals | `System.Net.Security.dll` | Provider implementation strategy that keeps socket I/O outside OpenSSL |
+| Schannel token TLS | Internal only | Runtime Schannel PAL internals | `System.Net.Security.dll` | Provider implementation strategy that consumes and produces TLS tokens |
+| kTLS TX/RX transition | Internal only, with public result reporting | Internal Linux/OpenSSL integration; result through `TransportTlsInfo.Offload` | `System.Net.Security.dll` | No public `KtlsConnection` or raw key-installation API is proposed |
+
+So, specifically, **`fd-bound OpenSSL TLS` is an internal implementation block**. A consumer selects/configures a transport provider and TLS policy; it does not construct an fd-bound OpenSSL object. The public contract reports portable results such as negotiated TLS and actual TX/RX offload state without exposing `SSL*`, BIOs, fds, epoll interests, or kTLS key installation.
 
 The contracts are intentionally layered:
 

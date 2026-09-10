@@ -10,39 +10,39 @@
 
 ```mermaid
 flowchart TB
-    subgraph Consumers["Consumer and framework layer"]
-        App["SocketSet subclass<br/>override OnAccept / OnConnect / OnReceive / OnWrite / OnClosed"]
-        Kestrel["SocketSet.AspNetCore<br/>builder.UseSocketSet(options)<br/>SocketSetTransportOptions<br/>SocketSetTransportMetrics"]
-        Redis["SocketSet.StackExchange.Redis<br/>SocketSetTunnel<br/>SocketSetClientEngine<br/>SocketSetClientTransport.ConnectAsync"]
-        Garnet["SocketSet.Garnet<br/>SocketSetGarnetServer"]
+    subgraph Consumers["Consumers"]
+        App["SocketSet subclass<br/>OnAccept<br/>OnConnect<br/>OnReceive<br/>OnWrite<br/>OnClosed"]
+        Kestrel["SocketSet.AspNetCore<br/>UseSocketSet<br/>TransportOptions<br/>TransportMetrics"]
+        Redis["SocketSet.Redis<br/>SocketSetTunnel<br/>ClientEngine<br/>ClientTransport"]
+        Garnet["SocketSet.Garnet<br/>GarnetServer"]
     end
 
-    subgraph Adapters["Adapter layer"]
-        PipeAdapter["Pipe adapter<br/>AcceptContext.UsePipe / ConnectContext.UsePipe<br/>internal PipeIoBridge"]
-        RedisAdapter["DuplexTransport adapter<br/>SocketSetClientTransport"]
-        KestrelAdapter["Kestrel listener and ConnectionContext bridge<br/>internal implementation"]
+    subgraph Adapters["Adapters"]
+        PipeAdapter["Pipe adapter<br/>UsePipe<br/>internal PipeIoBridge"]
+        RedisAdapter["Redis adapter<br/>DuplexTransport"]
+        KestrelAdapter["Kestrel adapter<br/>listener bridge<br/>ConnectionContext"]
     end
 
-    subgraph Engine["SocketSet engine / orchestration layer"]
-        Set["SocketSet<br/>Listen / Connect / ConnectShard / ListenHandle<br/>callback dispatch and engine lifetime"]
-        SetOptions["SocketSetOptions<br/>Factory selection, shared tuning, backend tuning, TLS"]
+    subgraph Engine["Engine / orchestration"]
+        Set["SocketSet<br/>Listen<br/>Connect<br/>ConnectShard<br/>ListenHandle"]
+        SetOptions["SocketSetOptions<br/>provider choice<br/>topology<br/>buffers<br/>TLS"]
     end
 
-    subgraph ConnectionLayer["SocketSet connection and callback layer"]
-        Connection["Connection<br/>IBufferWriter<byte><br/>Send / Flush / Close<br/>receive parking and metadata"]
-        Contexts["AcceptContext / ConnectContext<br/>ReceiveContext / WriteContext<br/>borrowed callback buffers"]
+    subgraph ConnectionLayer["Connection / callbacks"]
+        Connection["Connection<br/>IBufferWriter<br/>Send<br/>Flush<br/>Close"]
+        Contexts["AcceptContext<br/>ConnectContext<br/>ReceiveContext<br/>WriteContext"]
     end
 
-    subgraph TlsLayer["SocketSet TLS filter layer"]
-        TlsChoice["TlsProvider<br/>OpenSslTlsProvider / SChannelTlsProvider / IdentityTlsProvider"]
-        TlsFilter["TlsFilter<br/>DriveHandshake<br/>ProcessInbound / ProcessOutbound<br/>Shutdown"]
-        TlsCallbacks["OnClientAuthenticate / OnServerAuthenticate<br/>per-connection provider and TLS option selection"]
+    subgraph TlsLayer["TLS filters"]
+        TlsChoice["TlsProvider<br/>OpenSSL<br/>SChannel<br/>Identity"]
+        TlsFilter["TlsFilter<br/>DriveHandshake<br/>ProcessInbound<br/>ProcessOutbound<br/>Shutdown"]
+        TlsCallbacks["TLS selection callbacks<br/>OnClientAuthenticate<br/>OnServerAuthenticate"]
     end
 
-    subgraph ProviderLayer["SocketSet backend-provider layer"]
-        Factory["SocketSetFactory<br/>Default / IoUring / Epoll<br/>WindowsIocp / WindowsRio / Managed"]
-        Spi["SocketSetShard backend SPI<br/>Listen / Connect / ListenHandle<br/>OnInitialize / OnRun / OnShutdown"]
-        Backends["Backend implementations<br/>io_uring / epoll / IOCP / RIO / managed SAEA"]
+    subgraph ProviderLayer["Backend providers"]
+        Factory["SocketSetFactory<br/>Default<br/>IoUring / Epoll<br/>IOCP / RIO / Managed"]
+        Spi["SocketSetShard SPI<br/>Listen / Connect<br/>Initialize / Run<br/>Stop / Shutdown"]
+        Backends["Implementations<br/>io_uring<br/>epoll<br/>IOCP / RIO<br/>managed SAEA"]
     end
 
     App --> Set
@@ -65,7 +65,17 @@ flowchart TB
     Backends --> Connection
     Backends --> Contexts
     Backends --> TlsFilter
+
+    classDef consumer fill:#e8f4ff,stroke:#1976d2,color:#111
+    classDef existingAssembly fill:#e8f5e9,stroke:#2e7d32,color:#111
+    classDef existingInternal fill:#e8f5e9,stroke:#2e7d32,stroke-dasharray: 5 5,color:#111
+
+    class App consumer
+    class Kestrel,Redis,Garnet,Set,SetOptions,Connection,Contexts,TlsChoice,TlsFilter,TlsCallbacks,Factory,Spi existingAssembly
+    class PipeAdapter,RedisAdapter,KestrelAdapter,Backends existingInternal
 ```
+
+Diagram colors describe existing assembly placement: green boxes already live in a SocketSet assembly, dashed green boxes are internal implementations in those assemblies, and blue is consumer code outside SocketSet. This source map contains no proposed new assembly, so it has no yellow box.
 
 The most useful labels for our proposal comparison are:
 
@@ -81,34 +91,34 @@ This is materially different from the first runtime proposal, which put async ac
 
 ```mermaid
 sequenceDiagram
-    participant User
-    participant Set as SocketSet
-    participant Factory as SocketSetFactory
-    participant Shard as SocketSetShard
-    participant Tls as TlsFilter
-    participant Callback as SocketSet callbacks
-    participant Adapter
+    participant U as Consumer
+    participant E as SocketSet
+    participant F as Factory
+    participant S as Shard
+    participant T as TLS
+    participant C as Callback
+    participant A as Adapter
 
-    User->>Set: new DerivedSocketSet(SocketSetOptions)
-    Set->>Factory: CreateShard(options) x N
-    Set->>Shard: initialize or start worker loop
-    User->>Set: Listen(endpoint) or Connect(endpoint, token)
-    Set->>Shard: synchronous submit / enqueue
-    Shard-->>Shard: native accept/connect completion
-    Shard->>Set: ResolveServerTls / ResolveClientTls
+    U->>E: construct(options)
+    E->>F: CreateShard x N
+    E->>S: start loop
+    U->>E: Listen or Connect
+    E->>S: enqueue
+    S-->>S: native completion
+    S->>E: resolve TLS
     alt TLS selected
-        Shard->>Tls: DriveHandshake(input, handle, output)
-        Tls-->>Shard: NeedMoreData / Completed / Faulted
+        S->>T: DriveHandshake
+        T-->>S: status
     end
-    Shard->>Callback: OnAccept or OnConnect
+    S->>C: OnAccept / OnConnect
     alt raw callback mode
-        Shard->>Callback: OnReceive(ref context)
-        Callback-->>Shard: optional in-place ResponseBytes
+        S->>C: OnReceive
+        C-->>S: optional reply
     else pipe mode
-        Shard->>Adapter: PipeIoBridge.OnReceived
+        S->>A: OnReceived
     end
-    User->>Set: Dispose()
-    Set->>Shard: Stop()
+    U->>E: Dispose
+    E->>S: Stop
 ```
 
 The core does asynchronous I/O internally, but its public API is callback-based:
