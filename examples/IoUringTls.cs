@@ -1,20 +1,22 @@
 using System.Net;
 using System.Net.Transport;
-using System.Net.Transport.Linux;
+using System.Net.Transport.IoUring;
 using System.Security.Cryptography.X509Certificates;
 
 namespace NetworkTransportExamples;
 
-public static class EpollSocketBoundTls
+public static class IoUringTls
 {
     public static void RunServer(
         X509Certificate2 certificate)
     {
-        TransportProvider provider = TransportProviders.Epoll(
-            new EpollTransportOptions
+        TransportProvider provider = TransportProviders.IoUring(
+            new IoUringTransportOptions
             {
-                TlsStrategy = EpollTlsStrategy.SocketBoundOpenSsl,
-                ReusePort = true,
+                RingEntryCount = 4096,
+                ProvidedBufferCount = 512,
+                ReceiveBufferSize = 4096,
+                WriteBufferSize = 16384,
             });
 
         using TransportEngine engine = provider.CreateEngine(
@@ -25,9 +27,9 @@ public static class EpollSocketBoundTls
             },
             new EchoApplication());
 
-        // SSL_do_handshake runs against the nonblocking fd. WANT_READ/WANT_WRITE
-        // update epoll interest. The ClientHello callback is raised from that
-        // handshake; no memory BIO and no public ObserveClientHello call is used.
+        // TLS has one public meaning. The provider may internally use a
+        // memory-BIO, fd-bound polling, SslStream, or kTLS-capable path, but
+        // that choice does not change the application callback API.
         using TransportListener listener = engine.Listen(
             new TransportListenOptions
             {
@@ -52,7 +54,7 @@ public static class EpollSocketBoundTls
                 Tls = ExampleTls.CreateClient(
                     targetHost,
                     TlsOffloadPolicy.Prefer),
-                State = "epoll-tls-client",
+                State = "io-uring-tls-client",
             });
     }
 }

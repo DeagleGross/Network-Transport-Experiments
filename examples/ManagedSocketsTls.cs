@@ -14,16 +14,14 @@ public static class ManagedSocketsTls
             new ManagedSocketTransportOptions
             {
                 WaitForDataBeforeAllocatingBuffer = true,
-                TlsStrategy = ManagedSocketTlsStrategy.SslStream,
             });
 
         using TransportEngine engine = provider.CreateEngine(
             new TransportEngineOptions(),
             new EchoApplication());
 
-        // The managed provider still uses ordinary Socket/SAEA for transport I/O.
-        // TLS is configured on the listener. There is no AuthenticateAsServer call.
-        // An exact-compatibility implementation can internally use SslStream.
+        // The managed provider uses ordinary Socket/SAEA for transport I/O.
+        // TLS is configured on the listener and completed before OnReady.
         using TransportListener listener = engine.Listen(
             new TransportListenOptions
             {

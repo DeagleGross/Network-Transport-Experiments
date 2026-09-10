@@ -1,31 +1,34 @@
 using System.Net;
 using System.Net.Transport;
-using System.Net.Transport.Linux;
+using System.Net.Transport.Epoll;
 using System.Security.Cryptography.X509Certificates;
 
 namespace NetworkTransportExamples;
 
-public static class IoUringSocketBoundTls
+public static class EpollTls
 {
     public static void RunServer(
         X509Certificate2 certificate)
     {
-        TransportProvider provider = TransportProviders.IoUring(
-            new IoUringTransportOptions
+        TransportProvider provider = TransportProviders.Epoll(
+            new EpollTransportOptions
             {
-                TlsStrategy = IoUringTlsStrategy.SocketBoundPoll,
+                ReusePort = true,
+                ReceiveBufferSize = 4096,
+                WriteBufferSize = 4096,
             });
 
         using TransportEngine engine = provider.CreateEngine(
             new TransportEngineOptions
             {
                 InitialWorkerCount = Environment.ProcessorCount,
+                PinWorkerThreads = true,
             },
             new EchoApplication());
 
-        // OpenSSL owns a socket BIO. io_uring POLL completions drive
-        // SSL_do_handshake and SSL_read/SSL_write retry states. If kTLS
-        // activates, normal io_uring sends carry plaintext for kernel TX.
+        // TLS is part of the listener. The epoll provider owns the fd before,
+        // during, and after the handshake. The only early TLS bytes exposed to
+        // user code are those supplied to the ClientHello callback.
         using TransportListener listener = engine.Listen(
             new TransportListenOptions
             {
@@ -50,7 +53,7 @@ public static class IoUringSocketBoundTls
                 Tls = ExampleTls.CreateClient(
                     targetHost,
                     TlsOffloadPolicy.Prefer),
-                State = "io-uring-socket-bound-client",
+                State = "epoll-tls-client",
             });
     }
 }

@@ -26,15 +26,15 @@
 +public static class TransportProviders
 +{
 +    public static TransportProvider CreateDefault();
-+    public static TransportProvider ManagedSockets(ManagedSocketTransportOptions? options = null);
++    public static TransportProvider ManagedSockets(Sockets.ManagedSocketTransportOptions? options = null);
 +    [SupportedOSPlatform("linux")]
-+    public static TransportProvider Epoll(EpollTransportOptions? options = null);
++    public static TransportProvider Epoll(Epoll.EpollTransportOptions? options = null);
 +    [SupportedOSPlatform("linux")]
-+    public static TransportProvider IoUring(IoUringTransportOptions? options = null);
++    public static TransportProvider IoUring(IoUring.IoUringTransportOptions? options = null);
 +    [SupportedOSPlatform("windows")]
-+    public static TransportProvider WindowsIocp(IocpTransportOptions? options = null);
++    public static TransportProvider WindowsIocp(Iocp.IocpTransportOptions? options = null);
 +    [SupportedOSPlatform("windows")]
-+    public static TransportProvider WindowsRio(RioTransportOptions? options = null);
++    public static TransportProvider WindowsRio(Rio.RioTransportOptions? options = null);
 +}
 +
 +[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
@@ -77,11 +77,11 @@
 
 - Keep one sealed options type per built-in provider.
 - Prefer semantic resource names such as `RingEntryCount`, `CompletionBatchSize`, and `AcceptConcurrency`.
-- Keep TLS strategy selection provider-specific.
+- Do not expose fd-bound, memory-BIO, `SslStream`, or Schannel strategy switches.
 - Treat burst limits and exact pool counts as experimental until measurements demonstrate operator value.
 - Require the provider to reject invalid values and report resolved values.
 
-**Why:** The provider cannot be tuned or even characterized honestly without these settings, but putting them in one common bag recreates SocketSet's ambiguity. Typed options make unsupported combinations unrepresentable at the normal call site. Several knobs are still implementation-shaped, so they should remain experimental and be removed if only benchmark authors use them.
+**Why:** The provider cannot be tuned or even characterized honestly without these settings, but putting them in one common bag recreates SocketSet's ambiguity. Typed options make unsupported combinations unrepresentable at the normal call site. TLS has one public meaning; exposing the provider's current internal mechanism would multiply usage patterns and freeze implementation choices. Several resource knobs are still implementation-shaped, so they should remain experimental and be removed if only benchmark authors use them.
 
 ```diff
  namespace System.Net.Transport.Sockets;
@@ -93,17 +93,9 @@
 +    public int WriteBufferCount { get; set; }
 +    public bool WaitForDataBeforeAllocatingBuffer { get; set; }
 +    public bool PreferInlineCompletions { get; set; }
-+    public ManagedSocketTlsStrategy TlsStrategy { get; set; }
-+}
-+
-+public enum ManagedSocketTlsStrategy
-+{
-+    Auto,
-+    SslStream,
-+    PlatformFilter,
 +}
 
- namespace System.Net.Transport.Linux;
+ namespace System.Net.Transport.Epoll;
 
 +public sealed class EpollTransportOptions
 +{
@@ -114,16 +106,9 @@
 +    public int WriteBufferSize { get; set; }
 +    public int WriteBufferCount { get; set; }
 +    public bool ReusePort { get; set; }
-+    public EpollTlsStrategy TlsStrategy { get; set; }
 +}
-+
-+public enum EpollTlsStrategy
-+{
-+    Auto,
-+    SocketBoundOpenSsl,
-+    MemoryBio,
-+    SslStream,
-+}
+
+ namespace System.Net.Transport.IoUring;
 +
 +public sealed class IoUringTransportOptions
 +{
@@ -135,18 +120,9 @@
 +    public int OutOfBandWriteBufferCount { get; set; }
 +    public int MaximumBorrowedReceiveBuffers { get; set; }
 +    public bool ReusePort { get; set; }
-+    public IoUringTlsStrategy TlsStrategy { get; set; }
-+}
-+
-+public enum IoUringTlsStrategy
-+{
-+    Auto,
-+    MemoryBio,
-+    SocketBoundPoll,
-+    SslStream,
 +}
 
- namespace System.Net.Transport.Windows;
+ namespace System.Net.Transport.Iocp;
 
 +public sealed class IocpTransportOptions
 +{
@@ -155,8 +131,9 @@
 +    public int ReceiveBufferSize { get; set; }
 +    public int WriteBufferSize { get; set; }
 +    public int WriteBufferCount { get; set; }
-+    public WindowsTlsStrategy TlsStrategy { get; set; }
 +}
+
+ namespace System.Net.Transport.Rio;
 +
 +public sealed class RioTransportOptions
 +{
@@ -165,14 +142,6 @@
 +    public int ReceiveBufferSize { get; set; }
 +    public int SendBufferSize { get; set; }
 +    public int RegisteredSendBufferCount { get; set; }
-+    public WindowsTlsStrategy TlsStrategy { get; set; }
-+}
-+
-+public enum WindowsTlsStrategy
-+{
-+    Auto,
-+    Schannel,
-+    SslStream,
 +}
 ```
 
@@ -461,9 +430,10 @@
 - Make raw ClientHello observation a synchronous handshake callback.
 - Permit an async options-selection callback that suspends the handshake.
 - Reuse `SslClientAuthenticationOptions` and `SslServerAuthenticationOptions`.
+- Do not promise a raw-byte `UseHttps` middleware boundary for native TLS providers.
 - Keep fd-bound OpenSSL, memory-BIO OpenSSL, Schannel, and kTLS implementation types internal.
 
-**Why:** Authentication is a transport state transition before readiness, not an application read/write operation. OpenSSL and the DirectTLS study both demonstrate that ClientHello can be observed from the fd-bound handshake callback without a memory BIO or a separate public invocation. Reusing the existing options avoids a second TLS policy model. Implementation strategy belongs to provider options and internal runtime code.
+**Why:** Authentication is a transport state transition before readiness, not an application read/write operation. OpenSSL and the DirectTLS study both demonstrate that ClientHello can be observed from the fd-bound handshake callback without a memory BIO or a separate public invocation. Reusing the existing options avoids a second TLS policy model. The choice between fd-bound OpenSSL, memory BIO, `SslStream`, Schannel, and kTLS belongs to internal provider code, not public usage.
 
 ```diff
  namespace System.Net.Transport;
@@ -509,12 +479,13 @@
 
 | Assembly | Recommendation |
 |---|---|
-| `System.Net.Sockets.dll` | No new API required for the managed provider; it composes existing Socket/SAEA |
-| `System.Net.Security.dll` | Incubate the callback transport and built-in providers here while native TLS needs internal PAL access |
-| `System.Net.Transport.Pipelines.dll` | Add only when the callback core is proven; optional dependency |
+| `System.Net.Sockets.dll` | Keep unchanged; the managed provider composes existing Socket/SAEA |
+| `System.Net.Security.dll` | Keep existing TLS options and `SslStream`; define or refactor the native TLS boundary needed by transport |
+| `System.Net.Transport.dll` | Preferred home for callback contracts, provider options, and internal backend implementations |
+| `System.Net.Transport.Pipelines.dll` | Add only when the callback core is proven; optional adapter dependency |
 | ASP.NET Core | Keep Kestrel-specific scheduling, features, limits, and listener adaptation here |
 
-The assembly placement is pragmatic rather than taxonomic. A later move to a dedicated `System.Net.Transport.dll` requires a separately reviewed public low-level TLS engine contract or a runtime assembly refactor. It must not be accomplished with a new framework `InternalsVisibleTo` or `UnsafeAccessor`.
+The clean API placement is the assembly whose name matches the namespace. The unresolved implementation question is how fd-bound OpenSSL and Schannel reuse runtime TLS internals. Solve that through a separately reviewed low-level API or a lower shared implementation component, not by moving the public transport API into `System.Net.Security.dll` solely for internal access and not through framework `InternalsVisibleTo` or `UnsafeAccessor`.
 
 ## Current-to-revised comparison
 

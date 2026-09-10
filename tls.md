@@ -68,6 +68,20 @@ For a client connection:
 
 No application plaintext is exposed before successful authentication.
 
+## No raw-byte `UseHttps` middleware boundary
+
+The proposed transport does not promise today's Kestrel middleware composition where arbitrary middleware can read raw TCP bytes before `UseHttps` wraps an `IDuplexPipe`.
+
+When a listener or connect request enables TLS:
+
+- the provider owns the socket from accept/connect onward;
+- fd-bound OpenSSL may consume the ClientHello directly through its socket BIO;
+- the only user-visible pre-ready bytes are the borrowed first-record bytes in `TransportClientHelloCallback`;
+- `OnReady` and all receive callbacks expose authenticated plaintext;
+- Kestrel must configure TLS when it creates/binds the transport listener, not attach it later as an independent raw-byte wrapper.
+
+ASP.NET Core may retain familiar configuration syntax by translating endpoint HTTPS configuration into `TransportServerTlsOptions` before binding. That would be configuration compatibility, not middleware/byte-stream compatibility.
+
 ## Callback execution contract
 
 All proposed TLS callbacks have these semantics:

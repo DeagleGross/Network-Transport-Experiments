@@ -1,6 +1,6 @@
 using System.Net;
 using System.Net.Transport;
-using System.Net.Transport.Windows;
+using System.Net.Transport.Rio;
 using System.Security.Cryptography.X509Certificates;
 
 namespace NetworkTransportExamples;
@@ -19,7 +19,6 @@ public static class WindowsRioTls
                 ReceiveBufferSize = 4096,
                 SendBufferSize = 65536,
                 RegisteredSendBufferCount = 256,
-                TlsStrategy = WindowsTlsStrategy.Schannel,
             });
 
         using TransportEngine engine = provider.CreateEngine(
@@ -29,9 +28,8 @@ public static class WindowsRioTls
             },
             new EchoApplication());
 
-        // RIO drives the registered TCP data path. The internal Schannel engine
-        // still performs handshake and record transforms before application
-        // callbacks see plaintext.
+        // RIO drives the registered TCP data path. TLS remains provider-owned,
+        // and application callbacks see only authenticated plaintext.
         using TransportListener listener = engine.Listen(
             new TransportListenOptions
             {

@@ -33,35 +33,44 @@ This does **not** make the implementation synchronous. epoll, io_uring, IOCP, RI
 
 ## Assembly map
 
-The assembly placement is an incubation recommendation, not an approved runtime layout.
+Preferred API placement:
 
-| Assembly | Status | Responsibility |
-|---|---|---|
-| `System.Net.Sockets.dll` | Existing, unchanged | Public `Socket`, `SafeSocketHandle`, and SAEA APIs used by the managed provider |
-| `System.Net.Security.dll` | Existing | Incubation home for `System.Net.Transport` core/provider APIs and built-in providers, so native TLS can reuse existing OpenSSL/Schannel policy and PAL code without `InternalsVisibleTo` or `UnsafeAccessor` |
-| `System.Net.Transport.Pipelines.dll` | Proposed new optional assembly | Task/Pipelines adapters over the callback core |
-| ASP.NET Core Kestrel transport assembly/package | Existing ASP.NET Core layer | Maps Kestrel listener, connection, scheduler, feature, and timeout semantics to the runtime transport |
+| Assembly | Responsibility |
+|---|---|
+| `System.Net.Transport.dll` | Core callback API, provider selection/options, and internal backend implementations |
+| `System.Net.Transport.Pipelines.dll` | Optional Task, Stream, and Pipelines adapters |
+| `System.Net.Sockets.dll` | Existing Socket/SAEA implementation used by the managed provider |
+| `System.Net.Security.dll` | Existing TLS options, certificates, and `SslStream` |
 
-Why incubate the transport in `System.Net.Security.dll`:
+`System.Net.Security.dll` already references `System.Net.Sockets.dll`. A new `System.Net.Transport.dll` can reference both existing assemblies without creating a dependency cycle.
 
-- native TLS is a central requirement, not an optional wrapper;
-- the runtime's certificate normalization, validation, OpenSSL, Schannel, session, and channel-binding logic already lives there;
-- `System.Net.Security.dll` already depends on the socket stack;
-- putting a new framework assembly across that boundary would require either duplicated TLS policy or a separately reviewed public low-level TLS engine API.
+The unresolved part is native TLS reuse. fd-bound OpenSSL and the Schannel token engine currently depend on internal security implementation. The preferred public placement therefore requires one deliberate follow-up:
 
-If the transport stabilizes, a dedicated `System.Net.Transport.dll` can be reconsidered after the TLS engine boundary is deliberately extracted. Namespace and assembly names do not need to match during incubation.
+- expose a small experimental low-level TLS engine from `System.Net.Security`; or
+- refactor shared TLS implementation into a lower internal component referenced by both assemblies.
+
+Putting the entire transport API in `System.Net.Security.dll` remains the simplest implementation option, but the assembly name and responsibility would be misleading. Duplicating TLS policy or adding framework `InternalsVisibleTo`/`UnsafeAccessor` is not acceptable.
 
 ## Layer boundaries
 
 ```mermaid
 flowchart TB
-    App["Application or framework<br/>consumer code"]
-    Async["Async / Stream / Pipelines<br/>new optional adapter assembly"]
-    Core["Transport engine / callbacks<br/>System.Net.Transport<br/>System.Net.Security.dll"]
-    Provider["Provider selection / options<br/>System.Net.Transport.*<br/>System.Net.Security.dll"]
-    Managed["Managed Socket / SAEA<br/>internal implementation<br/>uses System.Net.Sockets.dll"]
-    Native["epoll / io_uring / IOCP / RIO<br/>internal implementations<br/>System.Net.Security.dll"]
-    Tls["OpenSSL / Schannel / kTLS<br/>internal implementations<br/>System.Net.Security.dll"]
+    App["Application or framework"]
+
+    subgraph Transport["NEW: System.Net.Transport.dll"]
+        Core["Transport callbacks<br/>System.Net.Transport"]
+        Provider["Provider options<br/>Transport subnamespaces"]
+        Managed["Managed Socket provider<br/>internal"]
+        Native["Native providers<br/>internal"]
+        TlsBridge["Native TLS bridge<br/>internal / boundary TBD"]
+    end
+
+    subgraph Adapters["NEW: Transport.Pipelines.dll"]
+        Async["Task / Stream / Pipelines"]
+    end
+
+    Sockets["System.Net.Sockets.dll<br/>Socket / SAEA"]
+    Security["System.Net.Security.dll<br/>TLS options / SslStream"]
 
     App --> Core
     App --> Async
@@ -69,19 +78,21 @@ flowchart TB
     Core --> Provider
     Provider --> Managed
     Provider --> Native
-    Managed --> Tls
-    Native --> Tls
+    Managed --> Sockets
+    Managed --> Security
+    Native --> TlsBridge
+    TlsBridge -. TLS boundary .-> Security
 
-    classDef consumer fill:#e8f4ff,stroke:#1976d2,color:#111
+    classDef consumer fill:#f5f5f5,stroke:#616161,color:#111
     classDef existingAssembly fill:#e8f5e9,stroke:#2e7d32,color:#111
-    classDef newAssembly fill:#fff8e1,stroke:#f9a825,color:#111
+    classDef newAssembly fill:#e3f2fd,stroke:#1565c0,color:#111
 
     class App consumer
-    class Async newAssembly
-    class Core,Provider,Managed,Native,Tls existingAssembly
+    class Core,Provider,Managed,Native,TlsBridge,Async newAssembly
+    class Sockets,Security existingAssembly
 ```
 
-Diagram colors show assembly placement: green is an existing runtime assembly, yellow is a proposed new optional adapter assembly, and blue is consumer code.
+Diagram colors show assembly placement: blue is a new assembly, green is an existing runtime assembly, and gray is consumer code.
 
 The core API ends at callbacks and borrowed buffers. `Task`, `Stream`, and `IDuplexPipe` ownership begins in the adapter layer.
 
@@ -100,23 +111,23 @@ public static class TransportProviders
     public static TransportProvider CreateDefault();
 
     public static TransportProvider ManagedSockets(
-        ManagedSocketTransportOptions? options = null);
+        Sockets.ManagedSocketTransportOptions? options = null);
 
     [SupportedOSPlatform("linux")]
     public static TransportProvider Epoll(
-        EpollTransportOptions? options = null);
+        Epoll.EpollTransportOptions? options = null);
 
     [SupportedOSPlatform("linux")]
     public static TransportProvider IoUring(
-        IoUringTransportOptions? options = null);
+        IoUring.IoUringTransportOptions? options = null);
 
     [SupportedOSPlatform("windows")]
     public static TransportProvider WindowsIocp(
-        IocpTransportOptions? options = null);
+        Iocp.IocpTransportOptions? options = null);
 
     [SupportedOSPlatform("windows")]
     public static TransportProvider WindowsRio(
-        RioTransportOptions? options = null);
+        Rio.RioTransportOptions? options = null);
 }
 
 [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
@@ -174,115 +185,88 @@ Semantics:
 The first draft omitted these. The revised API makes them explicit and provider-specific.
 
 ```csharp
-namespace System.Net.Transport.Sockets;
-
-[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public sealed class ManagedSocketTransportOptions
+namespace System.Net.Transport.Sockets
 {
-    public ManagedSocketTransportOptions();
+    [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+    public sealed class ManagedSocketTransportOptions
+    {
+        public ManagedSocketTransportOptions();
 
-    public int ReceiveBufferSize { get; set; } = 4096;
-    public int WriteBufferSize { get; set; } = 4096;
-    public int WriteBufferCount { get; set; } = 1024;
-    public bool WaitForDataBeforeAllocatingBuffer { get; set; } = true;
-    public bool PreferInlineCompletions { get; set; }
-    public ManagedSocketTlsStrategy TlsStrategy { get; set; } =
-        ManagedSocketTlsStrategy.Auto;
+        public int ReceiveBufferSize { get; set; } = 4096;
+        public int WriteBufferSize { get; set; } = 4096;
+        public int WriteBufferCount { get; set; } = 1024;
+        public bool WaitForDataBeforeAllocatingBuffer { get; set; } = true;
+        public bool PreferInlineCompletions { get; set; }
+    }
 }
 
-public enum ManagedSocketTlsStrategy
+namespace System.Net.Transport.Epoll
 {
-    Auto = 0,
-    SslStream = 1,
-    PlatformFilter = 2,
+    [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+    public sealed class EpollTransportOptions
+    {
+        public EpollTransportOptions();
+
+        public int MaximumEventsPerWait { get; set; } = 256;
+        public int ReadBurstLimit { get; set; } = 8;
+        public int WriteBurstLimit { get; set; } = 16;
+        public int ReceiveBufferSize { get; set; } = 4096;
+        public int WriteBufferSize { get; set; } = 4096;
+        public int WriteBufferCount { get; set; } = 1024;
+        public bool ReusePort { get; set; } = true;
+    }
 }
 
-namespace System.Net.Transport.Linux;
-
-[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public sealed class EpollTransportOptions
+namespace System.Net.Transport.IoUring
 {
-    public EpollTransportOptions();
+    [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+    public sealed class IoUringTransportOptions
+    {
+        public IoUringTransportOptions();
 
-    public int MaximumEventsPerWait { get; set; } = 256;
-    public int ReadBurstLimit { get; set; } = 8;
-    public int WriteBurstLimit { get; set; } = 16;
-    public int ReceiveBufferSize { get; set; } = 4096;
-    public int WriteBufferSize { get; set; } = 4096;
-    public int WriteBufferCount { get; set; } = 1024;
-    public bool ReusePort { get; set; } = true;
-    public EpollTlsStrategy TlsStrategy { get; set; } = EpollTlsStrategy.Auto;
+        public int RingEntryCount { get; set; } = 4096;
+        public int ProvidedBufferCount { get; set; } = 256;
+        public int ReceiveBufferSize { get; set; } = 4096;
+        public int WriteBufferSize { get; set; } = 4096;
+        public int WriteBufferCount { get; set; } = 1024;
+        public int OutOfBandWriteBufferCount { get; set; } = 256;
+        public int MaximumBorrowedReceiveBuffers { get; set; } = 128;
+        public bool ReusePort { get; set; } = true;
+    }
 }
 
-public enum EpollTlsStrategy
+namespace System.Net.Transport.Iocp
 {
-    Auto = 0,
-    SocketBoundOpenSsl = 1,
-    MemoryBio = 2,
-    SslStream = 3,
+    [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+    public sealed class IocpTransportOptions
+    {
+        public IocpTransportOptions();
+
+        public int CompletionBatchSize { get; set; } = 128;
+        public int AcceptConcurrency { get; set; } = 32;
+        public int ReceiveBufferSize { get; set; } = 4096;
+        public int WriteBufferSize { get; set; } = 4096;
+        public int WriteBufferCount { get; set; } = 1024;
+    }
 }
 
-[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public sealed class IoUringTransportOptions
+namespace System.Net.Transport.Rio
 {
-    public IoUringTransportOptions();
+    [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+    public sealed class RioTransportOptions
+    {
+        public RioTransportOptions();
 
-    public int RingEntryCount { get; set; } = 4096;
-    public int ProvidedBufferCount { get; set; } = 256;
-    public int ReceiveBufferSize { get; set; } = 4096;
-    public int WriteBufferSize { get; set; } = 4096;
-    public int WriteBufferCount { get; set; } = 1024;
-    public int OutOfBandWriteBufferCount { get; set; } = 256;
-    public int MaximumBorrowedReceiveBuffers { get; set; } = 128;
-    public bool ReusePort { get; set; } = true;
-    public IoUringTlsStrategy TlsStrategy { get; set; } = IoUringTlsStrategy.Auto;
-}
-
-public enum IoUringTlsStrategy
-{
-    Auto = 0,
-    MemoryBio = 1,
-    SocketBoundPoll = 2,
-    SslStream = 3,
-}
-
-namespace System.Net.Transport.Windows;
-
-[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public sealed class IocpTransportOptions
-{
-    public IocpTransportOptions();
-
-    public int CompletionBatchSize { get; set; } = 128;
-    public int AcceptConcurrency { get; set; } = 32;
-    public int ReceiveBufferSize { get; set; } = 4096;
-    public int WriteBufferSize { get; set; } = 4096;
-    public int WriteBufferCount { get; set; } = 1024;
-    public WindowsTlsStrategy TlsStrategy { get; set; } = WindowsTlsStrategy.Auto;
-}
-
-[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public sealed class RioTransportOptions
-{
-    public RioTransportOptions();
-
-    public int CompletionQueueSize { get; set; } = 4096;
-    public int AcceptConcurrency { get; set; } = 32;
-    public int ReceiveBufferSize { get; set; } = 4096;
-    public int SendBufferSize { get; set; } = 65536;
-    public int RegisteredSendBufferCount { get; set; } = 256;
-    public WindowsTlsStrategy TlsStrategy { get; set; } = WindowsTlsStrategy.Auto;
-}
-
-public enum WindowsTlsStrategy
-{
-    Auto = 0,
-    Schannel = 1,
-    SslStream = 2,
+        public int CompletionQueueSize { get; set; } = 4096;
+        public int AcceptConcurrency { get; set; } = 32;
+        public int ReceiveBufferSize { get; set; } = 4096;
+        public int SendBufferSize { get; set; } = 65536;
+        public int RegisteredSendBufferCount { get; set; } = 256;
+    }
 }
 ```
 
-These are candidate experimental knobs, not a claim that every value should stabilize. They are present now because provider behavior cannot be meaningfully discussed without the resources and strategy being selected. The API review later in this document recommends validating which knobs have real user scenarios before stabilization.
+These are candidate experimental resource knobs, not a claim that every value should stabilize. TLS implementation strategy is deliberately absent: configuring TLS has one public meaning, while fd-bound OpenSSL, memory-BIO OpenSSL, `SslStream`, Schannel, and kTLS are provider implementation decisions.
 
 ### Application callbacks
 
@@ -684,6 +668,14 @@ The connection has no `AuthenticateAsServerAsync` or `AuthenticateAsClientAsync`
 
 TLS is configured on the listener, connect options, or `OnAccepting` context. The engine drives the handshake before `OnReady`.
 
+When TLS is configured:
+
+- the provider owns the socket from accept/connect through handshake and application I/O;
+- application callbacks never receive arbitrary raw TCP ciphertext;
+- `ClientHelloCallback` is the supported early observation point;
+- `OnReady` and `OnReceive` expose only authenticated plaintext;
+- no `UseHttps`-style middleware insertion contract is required.
+
 Condensed transport-facing configuration:
 
 ```csharp
@@ -750,7 +742,7 @@ For fd-bound OpenSSL:
 
 No memory BIO or raw socket peek is required for the ClientHello callback.
 
-The exact internal OpenSSL/Schannel TLS-session API is not proposed as public transport API here. It remains in `System.Net.Security.dll` and is driven by built-in providers. If third-party providers need the same native TLS engine, that lower-level security API requires a separate public API review.
+The exact internal OpenSSL/Schannel TLS-session API is not proposed as public transport API here. Built-in providers choose their implementation internally. If third-party providers need the same native TLS engine, that lower-level security API requires a separate public API review.
 
 ## How the managed Socket provider fits
 
@@ -763,7 +755,7 @@ flowchart LR
     Socket["System.Net.Sockets.Socket"]
     Saea["SocketAsyncEventArgs"]
     Callbacks["TransportApplication callbacks"]
-    Tls["Internal TLS engine or SslStream path"]
+    Tls["Provider-owned TLS<br/>internal choice"]
 
     Select --> Engine
     Engine --> Socket
@@ -790,7 +782,7 @@ This is the same consumer API as epoll, io_uring, IOCP, and RIO. The managed pro
 
 ## How provider-specific use differs
 
-Consumer protocol code does not change. Provider creation and provider options change.
+Consumer protocol and TLS code does not change. Only provider creation and provider resource options change.
 
 ```csharp
 TransportProvider provider = TransportProviders.IoUring(
@@ -800,7 +792,6 @@ TransportProvider provider = TransportProviders.IoUring(
         ProvidedBufferCount = 512,
         ReceiveBufferSize = 4096,
         WriteBufferSize = 16384,
-        TlsStrategy = IoUringTlsStrategy.MemoryBio,
     });
 
 using TransportEngine engine = provider.CreateEngine(
@@ -829,10 +820,9 @@ Compilable illustrative usage files are under [`examples`](examples/README.md):
 - [`ManagedSocketsPlaintext.cs`](examples/ManagedSocketsPlaintext.cs)
 - [`ManagedSocketsTls.cs`](examples/ManagedSocketsTls.cs)
 - [`EpollPlaintext.cs`](examples/EpollPlaintext.cs)
-- [`EpollSocketBoundTls.cs`](examples/EpollSocketBoundTls.cs)
+- [`EpollTls.cs`](examples/EpollTls.cs)
 - [`IoUringPlaintext.cs`](examples/IoUringPlaintext.cs)
-- [`IoUringMemoryBioTls.cs`](examples/IoUringMemoryBioTls.cs)
-- [`IoUringSocketBoundTls.cs`](examples/IoUringSocketBoundTls.cs)
+- [`IoUringTls.cs`](examples/IoUringTls.cs)
 - [`WindowsIocpTls.cs`](examples/WindowsIocpTls.cs)
 - [`WindowsRioTls.cs`](examples/WindowsRioTls.cs)
 
@@ -843,7 +833,7 @@ Each file shows:
 - engine and listener lifetime;
 - the same callback-based read/write application;
 - TLS configuration and when the handshake completes;
-- important limitations of that provider/strategy.
+- important limitations of that provider.
 
 ## Higher-level async adapters
 
@@ -886,7 +876,7 @@ The adapter API should be designed after the callback core has a working managed
 5. Should immediate response buffers be retained in the BCL surface, or should `OnReceive` only expose payload and require `Connection.Send`?
 6. Which provider options have a real user scenario versus being benchmark-only implementation knobs?
 7. Does the first public SPI support third-party providers, or only built-in provider selection while the SPI incubates internally?
-8. What minimal public low-level TLS-session contract is needed if `System.Net.Transport` later moves out of `System.Net.Security.dll`?
+8. What internal or public TLS boundary lets a separate `System.Net.Transport.dll` reuse runtime TLS implementation without exposing provider strategy to consumers?
 
 ## API evolution rule
 

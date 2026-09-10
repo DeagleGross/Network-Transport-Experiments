@@ -15,19 +15,19 @@ public static class TransportProviders
         => throw new NotImplementedException();
 
     public static TransportProvider Epoll(
-        Linux.EpollTransportOptions? options = null)
+        Epoll.EpollTransportOptions? options = null)
         => throw new NotImplementedException();
 
     public static TransportProvider IoUring(
-        Linux.IoUringTransportOptions? options = null)
+        IoUring.IoUringTransportOptions? options = null)
         => throw new NotImplementedException();
 
     public static TransportProvider WindowsIocp(
-        Windows.IocpTransportOptions? options = null)
+        Iocp.IocpTransportOptions? options = null)
         => throw new NotImplementedException();
 
     public static TransportProvider WindowsRio(
-        Windows.RioTransportOptions? options = null)
+        Rio.RioTransportOptions? options = null)
         => throw new NotImplementedException();
 }
 

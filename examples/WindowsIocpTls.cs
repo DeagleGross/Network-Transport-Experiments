@@ -1,6 +1,6 @@
 using System.Net;
 using System.Net.Transport;
-using System.Net.Transport.Windows;
+using System.Net.Transport.Iocp;
 using System.Security.Cryptography.X509Certificates;
 
 namespace NetworkTransportExamples;
@@ -15,7 +15,6 @@ public static class WindowsIocpTls
             {
                 CompletionBatchSize = 128,
                 AcceptConcurrency = 32,
-                TlsStrategy = WindowsTlsStrategy.Schannel,
             });
 
         using TransportEngine engine = provider.CreateEngine(
@@ -25,8 +24,8 @@ public static class WindowsIocpTls
             },
             new EchoApplication());
 
-        // IOCP owns ciphertext WSARecv/WSASend operations. The internal Schannel
-        // engine consumes and emits TLS tokens. OnReady is post-handshake.
+        // IOCP owns network I/O. The provider chooses its internal Windows TLS
+        // implementation and raises OnReady only after authentication.
         using TransportListener listener = engine.Listen(
             new TransportListenOptions
             {

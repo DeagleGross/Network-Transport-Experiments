@@ -96,16 +96,16 @@ Ordinary applications should continue to use `TcpClient`, `Socket`, `NetworkStre
 
 ## Goals
 
-- One low-level contract for accepted and outbound TCP connections.
-- Provider-owned receive memory is borrowed only for a lexical callback.
-- Outbound data is composed into provider-owned memory and each logical flush has a completion identity.
-- Connect submission and cancellation have a first-class operation identity.
-- TLS uses existing `SslClientAuthenticationOptions` and `SslServerAuthenticationOptions` as the semantic source of truth.
-- Application callbacks run on the provider's owning execution context and must not block; async TLS policy callbacks suspend only their handshake and do not hold provider-global locks.
-- Unsupported TLS semantics fail explicitly or select the documented `Socket`/`SslStream` fallback.
-- Listener and engine disposal wait for terminal native completions before reclaiming operation state.
-- The same APIs work for servers and clients.
-- Kestrel integration is an adapter, not a dependency from runtime to ASP.NET Core.
+- Let callers choose managed Socket, epoll, io_uring, IOCP, RIO, or an automatic default.
+- Use the same server and client programming model with every provider.
+- Notify the application when a connection is accepted, connected, receives data, finishes a write, or closes.
+- Keep receive buffers valid for the duration of the receive callback.
+- Let applications build and submit writes without creating a Task for every write.
+- Configure TLS before a connection becomes ready, while preserving the existing .NET TLS options and callbacks.
+- Make the managed Socket provider a normal implementation of the design, not a special fallback API.
+- Keep provider-specific tuning on the provider that understands it.
+- Put Task, Stream, Pipelines, and Kestrel convenience APIs above the low-level callback layer.
+- Report unsupported behavior and failures clearly instead of silently ignoring options.
 
 ## Non-goals
 
@@ -116,6 +116,8 @@ Ordinary applications should continue to use `TcpClient`, `Socket`, `NetworkStre
 - Connection pooling, load balancing, retry, or protocol multiplexing policy.
 - A portable switch that configures kernel modules, privileges, drivers, NIC firmware, or `ethtool`.
 - A promise that native backends outperform `Socket`; that requires controlled measurements.
+- A `UseHttps`-style raw-byte middleware boundary for native TLS providers. When TLS is configured, the provider owns the socket and exposes only the ClientHello callback before authenticated plaintext.
+- Public switches for choosing fd-bound OpenSSL, memory BIO, `SslStream`, or Schannel internals.
 - A fake `SslStream` over a native TLS implementation.
 - A stable public provider-specific tuning surface before implementation evidence exists.
 - Cross-assembly `InternalsVisibleTo` or `UnsafeAccessor` access from ASP.NET Core into runtime implementation details.
@@ -124,40 +126,40 @@ Ordinary applications should continue to use `TcpClient`, `Socket`, `NetworkStre
 
 ```mermaid
 flowchart TD
-    subgraph ConsumerLayer["Consumer / adapter"]
-        App["App or framework<br/>consumer code"]
-        Pipe["Pipelines adapter<br/>proposed API<br/>System.Net.Transport.Pipelines<br/>new Transport.Pipelines.dll"]
+    App["App or framework"]
+
+    subgraph TransportAssembly["NEW: System.Net.Transport.dll"]
+        Core["Transport contracts<br/>System.Net.Transport"]
+        SocketProvider["Managed Socket<br/>System.Net.Transport.Sockets"]
+        EpollProvider["Linux epoll<br/>System.Net.Transport.Epoll"]
+        UringProvider["Linux io_uring<br/>System.Net.Transport.IoUring"]
+        IocpProvider["Windows IOCP<br/>System.Net.Transport.Iocp"]
+        RioProvider["Windows RIO<br/>System.Net.Transport.Rio"]
+        FdTls["fd-bound OpenSSL<br/>internal"]
+        BioTls["memory-BIO OpenSSL<br/>internal"]
+        Schannel["Schannel bridge<br/>internal"]
+        Ktls["kTLS TX / RX<br/>internal"]
     end
 
-    subgraph ConnectionLayer["Connection / lifecycle"]
-        Core["Transport contracts<br/>proposed API<br/>System.Net.Transport<br/>System.Net.Security.dll"]
+    subgraph AdapterAssembly["NEW: System.Net.Transport.Pipelines.dll"]
+        Pipe["Pipelines adapter"]
     end
 
-    subgraph ProviderLayer["Providers"]
-        SocketProvider["Managed Socket<br/>TransportProviders.ManagedSockets<br/>ManagedSocketTransportOptions<br/>System.Net.Security.dll"]
-        EpollProvider["Linux epoll<br/>TransportProviders.Epoll<br/>EpollTransportOptions<br/>System.Net.Security.dll"]
-        UringProvider["Linux io_uring<br/>TransportProviders.IoUring<br/>IoUringTransportOptions<br/>System.Net.Security.dll"]
-        IocpProvider["Windows IOCP<br/>TransportProviders.WindowsIocp<br/>IocpTransportOptions<br/>System.Net.Security.dll"]
-        RioProvider["Windows RIO<br/>TransportProviders.WindowsRio<br/>RioTransportOptions<br/>System.Net.Security.dll"]
+    subgraph ExistingAssemblies["EXISTING runtime assemblies"]
+        Sockets["System.Net.Sockets.dll<br/>Socket / SAEA"]
+        Security["System.Net.Security.dll<br/>TLS options / SslStream"]
     end
 
-    subgraph TlsImplementationLayer["TLS / offload"]
-        Ssl["SslStream fallback<br/>existing public type<br/>System.Net.Security.SslStream<br/>System.Net.Security.dll"]
-        FdTls["fd-bound OpenSSL<br/>internal implementation<br/>no public type<br/>System.Net.Security.dll"]
-        BioTls["memory-BIO OpenSSL<br/>internal implementation<br/>no public type<br/>System.Net.Security.dll"]
-        Schannel["Schannel tokens<br/>internal PAL<br/>no public type<br/>System.Net.Security.dll"]
-        Ktls["kTLS TX / RX<br/>internal implementation<br/>public result via TlsInfo<br/>System.Net.Security.dll"]
-    end
-
-    App --> Core
     App --> Pipe
+    App --> Core
     Pipe --> Core
     Core --> SocketProvider
     Core --> EpollProvider
     Core --> UringProvider
     Core --> IocpProvider
     Core --> RioProvider
-    SocketProvider --> Ssl
+    SocketProvider --> Sockets
+    SocketProvider --> Security
     EpollProvider --> FdTls
     EpollProvider --> BioTls
     UringProvider --> FdTls
@@ -165,39 +167,94 @@ flowchart TD
     IocpProvider --> Schannel
     RioProvider --> Schannel
     FdTls --> Ktls
+    FdTls -. TLS boundary .-> Security
+    BioTls -. TLS boundary .-> Security
+    Schannel -. TLS boundary .-> Security
 
-    classDef consumer fill:#e8f4ff,stroke:#1976d2,color:#111
+    classDef external fill:#f5f5f5,stroke:#616161,color:#111
     classDef existingAssembly fill:#e8f5e9,stroke:#2e7d32,color:#111
-    classDef newAssembly fill:#fff8e1,stroke:#f9a825,color:#111
+    classDef newAssembly fill:#e3f2fd,stroke:#1565c0,color:#111
 
-    class App consumer
-    class Pipe newAssembly
-    class Core,SocketProvider,EpollProvider,UringProvider,IocpProvider,RioProvider,Ssl,FdTls,BioTls,Schannel,Ktls existingAssembly
+    class App external
+    class Core,SocketProvider,EpollProvider,UringProvider,IocpProvider,RioProvider,FdTls,BioTls,Schannel,Ktls,Pipe newAssembly
+    class Sockets,Security existingAssembly
 ```
 
-Diagram colors describe **assembly placement**, not API maturity: green means the code would live in the existing `System.Net.Security.dll`, yellow means a proposed new assembly, and blue means code outside this runtime component.
+Diagram colors describe assembly placement: blue is a new assembly, green is an existing runtime assembly, and gray is consumer code. The dashed TLS arrows mark an unresolved implementation boundary.
 
 ### API and assembly placement
 
-The assembly placement below is an incubation recommendation, not an approved runtime layout. In particular, namespace and assembly name do not need to match.
+Preferred public placement:
 
-| Diagram block | Visibility | Namespace or type | Incubation assembly | Meaning |
-|---|---|---|---|---|
-| Server framework or client library | Consumer code | Application, Kestrel, Redis client, or another library | Outside this runtime component | Calls either the low-level contract or an adapter |
-| System.IO.Pipelines adapter | Proposed public experimental API | `System.Net.Transport.Pipelines` | Candidate `System.Net.Transport.Pipelines.dll` | Converts the low-level transport model into `IDuplexPipe`; not part of a backend |
-| System.Net.Transport contracts | Proposed public experimental API | `System.Net.Transport` | Initially `System.Net.Security.dll` | Provider, listener, connection, callback, and result contracts under discussion |
-| Managed Socket provider | Proposed provider-selection API | `TransportProviders.ManagedSockets(ManagedSocketTransportOptions)` | Initially `System.Net.Security.dll` | Returns the common `TransportProvider`; its Socket/SAEA implementation class remains internal |
-| Linux epoll provider | Proposed provider-selection API | `TransportProviders.Epoll(EpollTransportOptions)` | Initially `System.Net.Security.dll` | Returns the common provider; epoll loop, fd tables, events, and buffers remain internal |
-| Linux io_uring provider | Proposed provider-selection API | `TransportProviders.IoUring(IoUringTransportOptions)` | Initially `System.Net.Security.dll` | Returns the common provider; SQEs, CQEs, rings, buffer IDs, and cancellation state remain internal |
-| Windows IOCP provider | Proposed provider-selection API | `TransportProviders.WindowsIocp(IocpTransportOptions)` | Initially `System.Net.Security.dll` | Returns the common provider; completion ports, OVERLAPPED blocks, and Winsock calls remain internal |
-| Windows RIO provider | Proposed provider-selection API | `TransportProviders.WindowsRio(RioTransportOptions)` | Initially `System.Net.Security.dll` | Explicit, non-default RIO provider; registered buffer and queue implementation remains internal |
-| SslStream fallback TLS | Existing public API, internally composed by the provider | `System.Net.Security.SslStream` | `System.Net.Security.dll` | Exact compatibility implementation for existing TLS semantics |
-| fd-bound OpenSSL TLS | Internal only | Internal runtime type and OpenSSL interop | `System.Net.Security.dll` | Provider implementation strategy; not a public TLS class or a second `SslStream` |
-| memory-BIO OpenSSL TLS | Internal only | Existing/evolved runtime OpenSSL PAL internals | `System.Net.Security.dll` | Provider implementation strategy that keeps socket I/O outside OpenSSL |
-| Schannel token TLS | Internal only | Runtime Schannel PAL internals | `System.Net.Security.dll` | Provider implementation strategy that consumes and produces TLS tokens |
-| kTLS TX/RX transition | Internal only, with public result reporting | Internal Linux/OpenSSL integration; result through `TransportTlsInfo.Offload` | `System.Net.Security.dll` | No public `KtlsConnection` or raw key-installation API is proposed |
+| API | Namespace | Assembly |
+|---|---|---|
+| Core contracts | `System.Net.Transport` | `System.Net.Transport.dll` |
+| Managed provider options | `System.Net.Transport.Sockets` | `System.Net.Transport.dll` |
+| epoll provider options | `System.Net.Transport.Epoll` | `System.Net.Transport.dll` |
+| io_uring provider options | `System.Net.Transport.IoUring` | `System.Net.Transport.dll` |
+| IOCP provider options | `System.Net.Transport.Iocp` | `System.Net.Transport.dll` |
+| RIO provider options | `System.Net.Transport.Rio` | `System.Net.Transport.dll` |
+| Pipelines adapter | `System.Net.Transport.Pipelines` | `System.Net.Transport.Pipelines.dll` |
 
-So, specifically, **`fd-bound OpenSSL TLS` is an internal implementation block**. A consumer selects/configures a transport provider and TLS policy; it does not construct an fd-bound OpenSSL object. The public contract reports portable results such as negotiated TLS and actual TX/RX offload state without exposing `SSL*`, BIOs, fds, epoll interests, or kTLS key installation.
+Existing dependencies:
+
+| Existing API | Assembly |
+|---|---|
+| `Socket`, `SafeSocketHandle`, SAEA | `System.Net.Sockets.dll` |
+| TLS options, certificates, `SslStream` | `System.Net.Security.dll` |
+
+The provider implementation classes, epoll/io_uring/IOCP/RIO loops, fd-bound OpenSSL session, memory-BIO engine, Schannel bridge, and kTLS transition remain internal.
+
+### Where should native TLS live?
+
+There are three credible assembly choices:
+
+1. **Put all transport code in `System.Net.Security.dll`.** This gives direct access to existing TLS internals, but places a large transport/provider API in an assembly whose name no longer describes its main purpose.
+2. **Put transport code in `System.Net.Transport.dll` and use only public `System.Net.Security` APIs.** This is clean for plaintext and the `SslStream` fallback, but it cannot reuse the current internal fd-bound OpenSSL and Schannel machinery.
+3. **Put transport code in `System.Net.Transport.dll` and create a deliberate TLS boundary.** That boundary could be a small experimental low-level API in `System.Net.Security`, or an internal refactor into a lower implementation component shared by both assemblies. This is the preferred direction to investigate because it keeps the public transport API in the expected assembly without duplicating TLS policy.
+
+The design must not solve this with a new framework `InternalsVisibleTo` or `UnsafeAccessor`.
+
+So, specifically, **fd-bound OpenSSL is internal implementation**, not a public class. A consumer selects epoll or io_uring and supplies TLS options; it does not construct an OpenSSL session.
+
+## Runtime object roles
+
+```mermaid
+flowchart LR
+    User["Consumer"]
+    Provider["Provider<br/>backend choice"]
+    Engine["Engine<br/>running workers"]
+    AppCallbacks["Application<br/>callback receiver"]
+    Listener["Listener<br/>one bound endpoint"]
+    Connect["Connect request<br/>one outbound attempt"]
+    Connection["Connection<br/>one TCP peer"]
+
+    User --> Provider
+    Provider --> Engine
+    User --> AppCallbacks
+    AppCallbacks --> Engine
+    Engine --> Listener
+    Engine --> Connect
+    Listener --> Connection
+    Connect --> Connection
+    Engine -. events .-> AppCallbacks
+    AppCallbacks --> Connection
+
+    classDef user fill:#f5f5f5,stroke:#616161,color:#111
+    classDef runtime fill:#e3f2fd,stroke:#1565c0,color:#111
+
+    class User user
+    class Provider,Engine,AppCallbacks,Listener,Connect,Connection runtime
+```
+
+- **Provider:** describes which backend to use and holds its provider-specific options. It is cheap and does not represent a running server.
+- **Engine:** the running instance created from the provider. It owns worker threads, rings or completion ports, buffer pools, listeners, and active connections.
+- **Application:** only the callback receiver registered with the engine. It is not the whole user application. The name is tentative; `TransportHandler` or `TransportCallbacks` may be clearer.
+- **Listener:** represents one bound endpoint. Disposing it stops new accepts without stopping the whole engine.
+- **Connect request:** identifies one outbound connection attempt so success, failure, or cancellation can be matched to the caller.
+- **Connection:** represents one accepted or connected TCP peer. The application uses it to send, pause/resume receiving, shut down, or abort. Incoming data arrives through the application callback.
+
+The small connect/write operation values in the proposed API are simply **receipts**. A connect receipt lets an adapter match `OnReady` or `OnConnectFailed` to the original connect call. A write receipt lets it match `OnWriteCompleted` to the original flush. They do not own threads or native resources.
 
 The contracts are intentionally layered:
 
@@ -222,7 +279,7 @@ This shape is deliberate:
 - io_uring can invoke it over the CQE-selected provided buffer and return that buffer after the callback;
 - IOCP/RIO can invoke it over the completed registered/overlapped buffer;
 - the managed provider can invoke it from SAEA completion processing;
-- `ref struct` callback contexts make the borrowed lifetime lexical.
+- `ref struct` callback contexts prevent the callback object and its buffer from being stored for later use.
 
 An adapter that cannot consume synchronously copies or adopts the payload before returning. If it applies backpressure, it asks the connection to pause receiving and resumes it after downstream capacity returns.
 

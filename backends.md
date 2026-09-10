@@ -36,7 +36,7 @@ Provider selection and tuning are public at the provider level, while provider i
 | Windows IOCP | `TransportProviders.WindowsIocp(...)` | `IocpTransportOptions` |
 | Windows RIO | `TransportProviders.WindowsRio(...)` | `RioTransportOptions` |
 
-This deliberately differs from SocketSet's single `SocketSetOptions` bag: an epoll caller does not see ring-entry or RIO registered-buffer properties, and an io_uring caller can explicitly choose memory-BIO versus socket-bound-poll TLS without leaking that switch onto every provider.
+This deliberately differs from SocketSet's single `SocketSetOptions` bag: an epoll caller does not see ring-entry or RIO registered-buffer properties. TLS implementation strategy is not a public option; the io_uring provider can compare memory-BIO, socket-bound polling, `SslStream`, and kTLS internally without multiplying consumer APIs.
 
 ## Completion and buffer identity
 
