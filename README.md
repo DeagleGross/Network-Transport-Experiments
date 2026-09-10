@@ -9,6 +9,7 @@
 ## Navigation
 
 - [Proposed API and contracts](api.md)
+- [SocketSet public API and layer map](socketset-public-api-map.md)
 - [TLS option and callback parity](tls.md)
 - [Backend mappings and primers](backends.md)
 - [Requirement traceability](traceability.md)
@@ -122,18 +123,30 @@ Ordinary applications should continue to use `TcpClient`, `Socket`, `NetworkStre
 
 ```mermaid
 flowchart TD
-    App[Server framework or client library]
-    Pipe[System.IO.Pipelines adapter]
-    Core[System.Net.Transport contracts]
-    SocketProvider[Managed Socket provider]
-    EpollProvider[Linux epoll provider]
-    UringProvider[Linux io_uring provider]
-    IocpProvider[Windows IOCP provider]
-    Ssl[SslStream fallback TLS]
-    FdTls[fd-bound OpenSSL TLS]
-    BioTls[memory-BIO OpenSSL TLS]
-    Schannel[Schannel token TLS]
-    Ktls[kTLS TX/RX transition]
+    subgraph ConsumerLayer["Consumer and adapter layer"]
+        App[Server framework or client library]
+        Pipe[System.IO.Pipelines adapter]
+    end
+
+    subgraph ConnectionLayer["TransportConnection and lifecycle layer"]
+        Core[System.Net.Transport contracts]
+    end
+
+    subgraph ProviderLayer["Transport provider layer"]
+        SocketProvider[Managed Socket provider]
+        EpollProvider[Linux epoll provider]
+        UringProvider[Linux io_uring provider]
+        IocpProvider[Windows IOCP provider]
+        RioProvider[Windows RIO provider]
+    end
+
+    subgraph TlsImplementationLayer["TLS implementation and offload layer"]
+        Ssl[SslStream fallback TLS]
+        FdTls[fd-bound OpenSSL TLS]
+        BioTls[memory-BIO OpenSSL TLS]
+        Schannel[Schannel token TLS]
+        Ktls[kTLS TX/RX transition]
+    end
 
     App --> Core
     App --> Pipe
@@ -142,12 +155,14 @@ flowchart TD
     Core --> EpollProvider
     Core --> UringProvider
     Core --> IocpProvider
+    Core --> RioProvider
     SocketProvider --> Ssl
     EpollProvider --> FdTls
     EpollProvider --> BioTls
     UringProvider --> FdTls
     UringProvider --> BioTls
     IocpProvider --> Schannel
+    RioProvider --> Schannel
     FdTls --> Ktls
 ```
 
@@ -288,7 +303,8 @@ Native providers create and own their handles. Transferring an existing `Socket`
 | Managed `Socket` | Existing `Socket` async APIs | `SslStream` | Runtime may optimize internally | Broadest semantic compatibility; no claim that another backend is faster |
 | Linux epoll | Nonblocking fd + level-triggered readiness | Memory-BIO fallback | fd-bound OpenSSL; optional kTLS | Every TLS operation may switch between wanting read and write |
 | Linux io_uring | Accept/connect/send/recv CQEs, including multishot and provided buffers | Memory-BIO fallback | fd-bound OpenSSL driven by poll; optional kTLS | Buffer IDs, `F_MORE`, cancellation CQEs, and slot generations must outlive user cancellation |
-| Windows | Managed `Socket` already uses IOCP | `SslStream`/Schannel | Runtime-owned raw IOCP + Schannel token path if evidence warrants | Overlapped state remains alive until terminal completion; no Linux-style kTLS contract |
+| Windows IOCP | Raw Winsock overlapped operations and completion ports | `SslStream` or Schannel token/filter path | Runtime-owned completion batching and buffer ownership if evidence warrants | Overlapped state remains alive until terminal completion |
+| Windows RIO | Registered buffers with RIO request/completion queues; TCP-only experimental provider | Schannel token/filter path | Explicit registered-I/O data path for measured workloads | Narrower than IOCP, requires registered memory, is not the default, and is not a general io_uring equivalent |
 
 See [backends.md](backends.md) for concrete mappings and unresolved io_uring choices.
 
