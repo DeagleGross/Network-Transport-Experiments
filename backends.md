@@ -24,7 +24,19 @@ Every connection owns:
 - half-close and abort state;
 - references to any provider buffers or native operations that have not reached terminal completion.
 
-The backend can batch, prefetch, or use multiple native operations internally, but the consumer contract remains one active read result and one write operation.
+The backend can batch, prefetch, or use multiple native operations internally, but the consumer contract remains serialized receive callbacks per connection and ordered logical write operations.
+
+Provider selection and tuning are public at the provider level, while provider implementations remain internal:
+
+| Provider | Selection API | Typed options |
+|---|---|---|
+| Managed Socket | `TransportProviders.ManagedSockets(...)` | `ManagedSocketTransportOptions` |
+| Linux epoll | `TransportProviders.Epoll(...)` | `EpollTransportOptions` |
+| Linux io_uring | `TransportProviders.IoUring(...)` | `IoUringTransportOptions` |
+| Windows IOCP | `TransportProviders.WindowsIocp(...)` | `IocpTransportOptions` |
+| Windows RIO | `TransportProviders.WindowsRio(...)` | `RioTransportOptions` |
+
+This deliberately differs from SocketSet's single `SocketSetOptions` bag: an epoll caller does not see ring-entry or RIO registered-buffer properties, and an io_uring caller can explicitly choose memory-BIO versus socket-bound-poll TLS without leaking that switch onto every provider.
 
 ## Completion and buffer identity
 
@@ -32,10 +44,11 @@ The common API intentionally hides native identifiers, but the SPI implementatio
 
 | Backend | Native operation identity | Buffer identity | Safe reuse point |
 |---|---|---|---|
-| Managed `Socket`/SAEA | `SocketAsyncEventArgs` instance or runtime async operation object | SAEA buffer or provider pool lease | Completion callback processed and consumer advanced receive data |
-| epoll | Registered fd plus connection generation and current interest state | Provider pool slot used by the synchronous `recv` performed after readiness | Consumer advanced receive data |
-| io_uring | CQE `user_data` encoding operation kind, connection slot, and generation | CQE buffer ID from `IORING_CQE_F_BUFFER`, plus buffer group | Consumer advanced segment and buffer returned to ring; operation identity retained until final CQE without `F_MORE` |
-| IOCP | OVERLAPPED address plus connection slot/generation | Receive buffer associated with the OVERLAPPED | Completion dequeued and consumer advanced receive data |
+| Managed `Socket`/SAEA | `SocketAsyncEventArgs` instance or runtime async operation object | SAEA buffer or provider pool lease | `OnReceive` has returned and no attached adapter retains the data |
+| epoll | Registered fd plus connection generation and current interest state | Provider pool slot used by the synchronous `recv` performed after readiness | `OnReceive` has returned |
+| io_uring | CQE `user_data` encoding operation kind, connection slot, and generation | CQE buffer ID from `IORING_CQE_F_BUFFER`, plus buffer group | `OnReceive` has returned and the buffer is returned to the ring; operation identity remains until the final CQE without `F_MORE` |
+| IOCP | OVERLAPPED address plus connection slot/generation | Receive buffer associated with the OVERLAPPED | Completion dequeued and `OnReceive` has returned |
+| RIO | RIO request/completion identity plus connection generation | Registered buffer ID and offset | Completion drained and `OnReceive` has returned |
 
 Connection generations are not optional bookkeeping. File descriptors, socket handles, slot indexes, buffer IDs, and native memory addresses are reused. A late completion must be distinguishable from the current tenant of that reused resource.
 
@@ -74,9 +87,9 @@ Source basis: [runtime Socket and handle ownership](sources.md#s-runtime-sockets
 |---|---|
 | Listen | Create/bind/listen `Socket`, retain listener ownership |
 | Accept | `Socket.AcceptAsync(CancellationToken)` |
-| Connect | `Socket.ConnectAsync(EndPoint, CancellationToken)` |
-| Read | One pooled receive buffer plus `Socket.ReceiveAsync`; expose filled memory until `AdvanceRead` |
-| Write | Iterate/scatter over `ReadOnlySequence<byte>` with existing Socket APIs; hide partial sends |
+| Connect | Synchronous core submission backed by `Socket.ConnectAsync(SocketAsyncEventArgs)`; completion maps to `OnReady` or `OnConnectFailed` |
+| Read | One pooled receive buffer plus `Socket.ReceiveAsync`; invoke `OnReceive` over the completed span |
+| Write | Provider-owned composition plus `Socket.SendAsync`; hide partial sends and raise one logical write-completion callback |
 | Pre-auth ClientHello | Read and retain the first TLS record in the internal Stream adapter, invoke the observer, then replay the retained bytes to `SslStream` |
 | TLS | `SslStream` over an internal `Stream` adapter |
 | Shutdown | `SslStream.ShutdownAsync` when secured, then `Socket.Shutdown(Send)` |
@@ -160,7 +173,7 @@ This means three identities matter:
 2. operation identity: operation kind plus submission generation in `user_data`;
 3. buffer identity: buffer group and CQE buffer ID.
 
-The consumer's `TransportReadResult` does not expose those raw values. The provider attaches them to the sequence segments and returns each buffer only after `AdvanceRead` moves past it.
+The consumer never sees those raw values. The provider invokes `OnReceive` over the selected buffer and returns the buffer to its ring after the callback or after an attached adapter has copied/adopted it under a provider-specific internal contract.
 
 ### Plaintext mapping
 
@@ -234,7 +247,7 @@ These are explicit design questions, not invented answers:
 2. Is multishot accept used for every listener, and how are peer/local addresses obtained without unsafe shared address storage?
 3. Does plaintext receive use multishot recv, multishot recvmsg, bundled receives, or a version-gated combination?
 4. How are CQE `user_data`, connection generation, and buffer ID encoded without truncation across architectures?
-5. When a read result spans several CQEs, how are partially consumed segments returned while later segments remain leased?
+5. Does each CQE produce one `OnReceive`, or can the provider batch several selected buffers into one callback without exposing a retained multi-segment lifetime?
 6. What exact bound applies to CQEs that arrive after downstream backpressure begins?
 7. Is receive parking implemented by canceling the exact multishot `user_data`, by not rearming after terminal CQE, or by another kernel feature?
 8. How does cancellation distinguish the cancellation request's CQE from the canceled operation's terminal CQE?
@@ -311,16 +324,15 @@ The common public API should not expose `EpollTlsMode`, `IoUringTlsMode`, or `Us
 
 ### Baseline universal bridge
 
-The baseline `TransportPipelines` implementation works for every provider:
+The baseline callback-to-Pipelines adapter works for every provider:
 
-- one receive pump copies provider-owned read segments into the inbound pipe and advances the provider result;
-- one send pump passes outbound pipe sequences to `WriteAsync` and advances the pipe only after completion;
-- an async inbound flush stops the next `ReadAsync`, creating real backpressure at the low-level contract;
+- `OnReceive` copies provider-owned payload into the inbound pipe;
+- an incomplete inbound flush calls `TryPauseReceive`, and its continuation later calls `ResumeReceive`;
+- the outbound pipe reader composes data into `TransportConnection`, calls `Flush`, and records the returned `TransportWriteOperation`;
+- `OnWriteCompleted` advances the outbound pipe and completes the matching adapter waiter;
 - already completed native reads are bounded by provider pool size;
 - errors complete both pipe directions and abort the connection;
-- normal output completion drains, calls `ShutdownWriteAsync`, and permits input to continue until peer EOF;
-- disposal aborts unless graceful shutdown already completed;
-- `LeaveOpen` controls only final connection disposal, not operation ownership.
+- normal output completion drains and calls `ShutdownWrite`, while input may continue until peer EOF.
 
 ### Optimized adapters
 

@@ -921,7 +921,7 @@ An fd-bound OpenSSL server does not need a memory BIO or a raw socket peek to ex
 
 The current DirectTLS study follows the same shape through the runtime TLS session: the pump advances the fd-bound handshake until the session reports that it needs a TLS context, copies the parsed ClientHello record from the session, suspends the handshake while the user callback runs, and resumes it on the pump thread. No memory BIO is required.
 
-That supports a registered callback on the TLS/provider configuration, not a consumer call named `ObserveTlsClientHelloAsync`. The separate-invocation API in the first proposal was added to mimic Kestrel's separate listener timeout, but it is the wrong abstraction for the low-level layer. A higher Kestrel adapter can implement separate timeout accounting around a callback phase exposed by the handshake state machine.
+That supports a registered callback on the TLS/provider configuration, not a consumer call named `ObserveTlsClientHelloAsync`. The revised proposal keeps separate `ClientHelloTimeout` and `HandshakeTimeout` values on the TLS policy while the provider drives one handshake state machine.
 
 ### 5. Why was listener acquisition and disposal async?
 
@@ -972,7 +972,7 @@ Some shape-specific critique should be rerun after this discussion because the c
 |---|---|---|---|
 | Core completion model | `ValueTask` accept/read/write/authenticate | synchronous submit plus callbacks | Decide whether callback SPI is the true core |
 | Listener lifetime | async listener object | listeners owned by whole engine | Keep a listener object, but decide sync start and async drain separately |
-| Connection read API | provider-owned `ReadOnlySequence` plus `AdvanceRead` | no read API; callback receives borrowed `ReadOnlySpan` | Compare lexical callback borrow with retained sequence lease |
+| Connection read API | provider-owned `ReadOnlySequence` plus `AdvanceRead` | no read API; callback receives borrowed `ReadOnlySpan` | Revised core chooses the lexical callback borrow; retained sequences belong to adapters |
 | Connection write API | `WriteAsync(ReadOnlySequence)` | `IBufferWriter`/`Flush`, `Send`, and write-completion callback | Decide whether completion is callback, token, or optional async adapter |
 | TLS | authenticate methods on connection | provider/filter state machine driven by backend | Move low-level TLS to provider/filter layer |
 | ClientHello | separate async method plus callback | should arise during handshake | Use a handshake callback/state transition |

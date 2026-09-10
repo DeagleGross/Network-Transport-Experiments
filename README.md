@@ -9,6 +9,7 @@
 ## Navigation
 
 - [Proposed API and contracts](api.md)
+- [Provider usage examples](examples/README.md)
 - [SocketSet public API and layer map](socketset-public-api-map.md)
 - [TLS option and callback parity](tls.md)
 - [Backend mappings and primers](backends.md)
@@ -96,13 +97,13 @@ Ordinary applications should continue to use `TcpClient`, `Socket`, `NetworkStre
 ## Goals
 
 - One low-level contract for accepted and outbound TCP connections.
-- One read and one write may proceed concurrently; same-direction operations are serialized by contract.
-- Provider-owned receive memory remains valid until the consumer explicitly advances it.
-- Writes accept a `ReadOnlySequence<byte>` and complete only when the provider no longer accesses the source.
+- Provider-owned receive memory is borrowed only for a lexical callback.
+- Outbound data is composed into provider-owned memory and each logical flush has a completion identity.
+- Connect submission and cancellation have a first-class operation identity.
 - TLS uses existing `SslClientAuthenticationOptions` and `SslServerAuthenticationOptions` as the semantic source of truth.
-- User callbacks never run on a backend polling/completion loop and never run while a provider lock required for unrelated connections is held.
+- Application callbacks run on the provider's owning execution context and must not block; async TLS policy callbacks suspend only their handshake and do not hold provider-global locks.
 - Unsupported TLS semantics fail explicitly or select the documented `Socket`/`SslStream` fallback.
-- Provider disposal and connection disposal wait for terminal native completions before reclaiming operation state.
+- Listener and engine disposal wait for terminal native completions before reclaiming operation state.
 - The same APIs work for servers and clients.
 - Kestrel integration is an adapter, not a dependency from runtime to ASP.NET Core.
 
@@ -133,11 +134,11 @@ flowchart TD
     end
 
     subgraph ProviderLayer["Providers"]
-        SocketProvider["Managed Socket<br/>proposed provider API<br/>System.Net.Transport.Sockets<br/>System.Net.Security.dll"]
-        EpollProvider["Linux epoll<br/>proposed provider API<br/>System.Net.Transport.Linux<br/>System.Net.Security.dll"]
-        UringProvider["Linux io_uring<br/>proposed provider API<br/>System.Net.Transport.Linux<br/>System.Net.Security.dll"]
-        IocpProvider["Windows IOCP<br/>proposed provider API<br/>System.Net.Transport.Windows<br/>System.Net.Security.dll"]
-        RioProvider["Windows RIO<br/>API shape TBD<br/>System.Net.Transport.Windows<br/>System.Net.Security.dll"]
+        SocketProvider["Managed Socket<br/>TransportProviders.ManagedSockets<br/>ManagedSocketTransportOptions<br/>System.Net.Security.dll"]
+        EpollProvider["Linux epoll<br/>TransportProviders.Epoll<br/>EpollTransportOptions<br/>System.Net.Security.dll"]
+        UringProvider["Linux io_uring<br/>TransportProviders.IoUring<br/>IoUringTransportOptions<br/>System.Net.Security.dll"]
+        IocpProvider["Windows IOCP<br/>TransportProviders.WindowsIocp<br/>IocpTransportOptions<br/>System.Net.Security.dll"]
+        RioProvider["Windows RIO<br/>TransportProviders.WindowsRio<br/>RioTransportOptions<br/>System.Net.Security.dll"]
     end
 
     subgraph TlsImplementationLayer["TLS / offload"]
@@ -168,15 +169,13 @@ flowchart TD
     classDef consumer fill:#e8f4ff,stroke:#1976d2,color:#111
     classDef existingAssembly fill:#e8f5e9,stroke:#2e7d32,color:#111
     classDef newAssembly fill:#fff8e1,stroke:#f9a825,color:#111
-    classDef existingAssemblyTbd fill:#e8f5e9,stroke:#2e7d32,stroke-dasharray: 5 5,color:#111
 
     class App consumer
     class Pipe newAssembly
-    class Core,SocketProvider,EpollProvider,UringProvider,IocpProvider,Ssl,FdTls,BioTls,Schannel,Ktls existingAssembly
-    class RioProvider existingAssemblyTbd
+    class Core,SocketProvider,EpollProvider,UringProvider,IocpProvider,RioProvider,Ssl,FdTls,BioTls,Schannel,Ktls existingAssembly
 ```
 
-Diagram colors describe **assembly placement**, not API maturity: green means the code would live in the existing `System.Net.Security.dll`, yellow means a proposed new assembly, blue means code outside this runtime component, and dashed green means the API shape is still undecided inside an existing assembly.
+Diagram colors describe **assembly placement**, not API maturity: green means the code would live in the existing `System.Net.Security.dll`, yellow means a proposed new assembly, and blue means code outside this runtime component.
 
 ### API and assembly placement
 
@@ -187,11 +186,11 @@ The assembly placement below is an incubation recommendation, not an approved ru
 | Server framework or client library | Consumer code | Application, Kestrel, Redis client, or another library | Outside this runtime component | Calls either the low-level contract or an adapter |
 | System.IO.Pipelines adapter | Proposed public experimental API | `System.Net.Transport.Pipelines` | Candidate `System.Net.Transport.Pipelines.dll` | Converts the low-level transport model into `IDuplexPipe`; not part of a backend |
 | System.Net.Transport contracts | Proposed public experimental API | `System.Net.Transport` | Initially `System.Net.Security.dll` | Provider, listener, connection, callback, and result contracts under discussion |
-| Managed Socket provider | Proposed public experimental provider facade | `System.Net.Transport.Sockets.SocketTransportProvider` | Initially `System.Net.Security.dll` | Public provider selection/configuration surface; its SAEA/Socket machinery remains internal |
-| Linux epoll provider | Proposed public experimental provider facade | `System.Net.Transport.Linux.EpollTransportProvider` | Initially `System.Net.Security.dll` | Public provider selection/configuration surface; epoll loop, fd tables, events, and buffers remain internal |
-| Linux io_uring provider | Proposed public experimental provider facade | `System.Net.Transport.Linux.IoUringTransportProvider` | Initially `System.Net.Security.dll` | Public provider selection/configuration surface; SQEs, CQEs, rings, buffer IDs, and cancellation state remain internal |
-| Windows IOCP provider | Proposed public experimental provider facade | `System.Net.Transport.Windows.IocpTransportProvider` | Initially `System.Net.Security.dll` | Public provider selection/configuration surface; completion ports, OVERLAPPED blocks, and Winsock calls remain internal |
-| Windows RIO provider | Architecture candidate; public shape not yet proposed | Candidate `System.Net.Transport.Windows` type | Initially `System.Net.Security.dll` | RIO should be selectable for experiments, but its public type/options still need design |
+| Managed Socket provider | Proposed provider-selection API | `TransportProviders.ManagedSockets(ManagedSocketTransportOptions)` | Initially `System.Net.Security.dll` | Returns the common `TransportProvider`; its Socket/SAEA implementation class remains internal |
+| Linux epoll provider | Proposed provider-selection API | `TransportProviders.Epoll(EpollTransportOptions)` | Initially `System.Net.Security.dll` | Returns the common provider; epoll loop, fd tables, events, and buffers remain internal |
+| Linux io_uring provider | Proposed provider-selection API | `TransportProviders.IoUring(IoUringTransportOptions)` | Initially `System.Net.Security.dll` | Returns the common provider; SQEs, CQEs, rings, buffer IDs, and cancellation state remain internal |
+| Windows IOCP provider | Proposed provider-selection API | `TransportProviders.WindowsIocp(IocpTransportOptions)` | Initially `System.Net.Security.dll` | Returns the common provider; completion ports, OVERLAPPED blocks, and Winsock calls remain internal |
+| Windows RIO provider | Proposed provider-selection API | `TransportProviders.WindowsRio(RioTransportOptions)` | Initially `System.Net.Security.dll` | Explicit, non-default RIO provider; registered buffer and queue implementation remains internal |
 | SslStream fallback TLS | Existing public API, internally composed by the provider | `System.Net.Security.SslStream` | `System.Net.Security.dll` | Exact compatibility implementation for existing TLS semantics |
 | fd-bound OpenSSL TLS | Internal only | Internal runtime type and OpenSSL interop | `System.Net.Security.dll` | Provider implementation strategy; not a public TLS class or a second `SslStream` |
 | memory-BIO OpenSSL TLS | Internal only | Existing/evolved runtime OpenSSL PAL internals | `System.Net.Security.dll` | Provider implementation strategy that keeps socket I/O outside OpenSSL |
@@ -204,11 +203,10 @@ The contracts are intentionally layered:
 
 1. `TransportProvider` owns shared backend resources.
 2. `TransportListener` owns one bound listener.
-3. `TransportConnection` owns one connected ordered byte stream and its operation state.
-4. A server can observe the first ClientHello record under a separate timeout before authentication; the provider preserves those bytes for the handshake.
-5. TLS authentication transitions the same connection from ciphertext transport to authenticated plaintext semantics.
-6. `TransportPipelines` is a reusable adapter above the low-level connection.
-7. Kestrel maps the adapter and `TransportTlsInfo` to ASP.NET Core connection features.
+3. `TransportApplication` receives accept, ready, receive, write-completion, close, and provider callbacks.
+4. `TransportConnection` is stable connection identity, outbound writer, backpressure control, and metadata; it has no public read method.
+5. TLS policy is selected before readiness and the provider drives the handshake, including ClientHello callbacks.
+6. Task, Stream, Pipelines, and Kestrel APIs are adapters above the callback core.
 
 The detailed signatures and member rationale are in [api.md](api.md).
 
@@ -216,39 +214,41 @@ The detailed signatures and member rationale are in [api.md](api.md).
 
 ### Receive
 
-`ReadAsync` returns a `ReadOnlySequence<byte>` backed by provider-owned memory. The memory remains valid until `AdvanceRead` is called. Only one read may be pending, and only one unadvanced result may exist.
+The provider invokes `TransportApplication.OnReceive(ref TransportReceiveContext)` with a borrowed `ReadOnlySpan<byte>`. The span is valid only for the callback. There is no task-based read operation and no caller-supplied read buffer in the low-level API.
 
 This shape is deliberate:
 
-- epoll can read into a provider pool and expose the filled region;
-- io_uring can retain the CQE-selected buffer ID until the corresponding sequence segment is consumed;
-- IOCP can retain its overlapped receive buffer until advancement;
-- managed `Socket` can use a pooled receive buffer;
-- a Pipelines adapter can consume a sequence without forcing the low-level API to depend on `PipeReader`.
+- epoll can invoke the callback over its per-connection receive buffer;
+- io_uring can invoke it over the CQE-selected provided buffer and return that buffer after the callback;
+- IOCP/RIO can invoke it over the completed registered/overlapped buffer;
+- the managed provider can invoke it from SAEA completion processing;
+- `ref struct` callback contexts make the borrowed lifetime lexical.
 
-The provider may aggregate several native completions into one sequence. It must not return a buffer to a ring or pool until the consumer advances past that segment.
+An adapter that cannot consume synchronously copies or adopts the payload before returning. If it applies backpressure, it asks the connection to pause receiving and resumes it after downstream capacity returns.
 
 ### Write
 
-`WriteAsync(ReadOnlySequence<byte>)` is all-or-error at the transport contract. The provider handles partial native sends internally. Completion means the provider no longer reads any segment in the supplied sequence, so the caller may reuse or return the memory.
+`TransportConnection` implements `IBufferWriter<byte>`. The caller composes bytes into provider-owned memory and calls `Flush`, or uses a copying `Send` helper. `Flush` returns a `TransportWriteOperation` value used to correlate `OnWriteCompleted`.
 
-Only one write may be pending. A read and a write may be pending concurrently. This matches the useful concurrency allowed by `SslStream` and avoids ambiguous ordering between concurrent writers.
+The provider handles partial native sends internally and preserves logical write ordering. The core allocates no Task for write completion. A higher-level adapter can map operation IDs to Task completion sources.
 
 ### Completion and cancellation
 
-Cancellation requests cancellation of the caller's operation; it does not grant permission to recycle native state early. For completion APIs, a canceled io_uring request still has a terminal CQE and a canceled Windows overlapped operation still completes. Providers retain operation descriptors, pins, buffer IDs, connection generations, and native handles until that terminal signal has been processed.
+`TransportEngine.Connect` returns a cancelable `TransportConnectOperation`. Connect success reaches `OnReady`; failure reaches `OnConnectFailed`. Cancellation does not permit the provider to recycle native state early: io_uring still requires the target operation's terminal CQE, and Windows still requires the overlapped completion to drain.
 
-Completion racing cancellation may produce either the successful result or `OperationCanceledException`. Once a connection-level failure occurs, subsequent operations fail with the same terminal error where practical. `Completion` is a reusable task that reports orderly close or the terminal error.
+Receive has no per-callback cancellation token. The application controls flow through listener disposal, connect cancellation, `TryPauseReceive`/`ResumeReceive`, half-close, and abort. This is intentionally lower-level than `Socket.ReceiveAsync`.
 
 ### Shutdown
 
-- `ShutdownWriteAsync` drains accepted writes, emits TLS `close_notify` when TLS is active, and then performs the transport write-half shutdown.
-- `Abort` initiates immediate teardown and faults pending operations.
-- `DisposeAsync` waits until native operations can no longer reference provider memory or a recycled connection slot. It does not promise graceful network shutdown; call `ShutdownWriteAsync` first when graceful close matters.
+- `ShutdownRead` stops future receive callbacks.
+- `ShutdownWrite` drains accepted writes, emits TLS `close_notify` when TLS is active, and performs transport write-half shutdown.
+- `Abort` initiates immediate teardown.
+- `OnClosed` carries the connection phase, close reason, and exception.
+- listener and engine disposal are synchronous control-plane boundaries that drain their native operations before returning.
 
 ## TLS is a first-class lifecycle
 
-TLS authentication is explicit and performed before application I/O. The same connection object transitions from unauthenticated transport bytes to authenticated plaintext bytes. The runtime implementation may use:
+TLS is configured on listener/connect options or in the pre-handshake accepting callback. The provider performs authentication before `OnReady`; application I/O begins only after that callback. The runtime implementation may use:
 
 - `SslStream` over a transport-to-`Stream` adapter;
 - fd-bound nonblocking OpenSSL;
@@ -256,9 +256,9 @@ TLS authentication is explicit and performed before application I/O. The same co
 - Schannel token generation and record transforms;
 - a userspace handshake followed by kTLS.
 
-The listener returns the connected TCP stream before TLS authentication. A server framework can therefore apply connection accounting, handshake concurrency limits, timeouts, logging, and load shedding consistently before expensive TLS work. This avoids the current DirectTLS-specific need for a second pre-handshake connection limit below Kestrel.
+`OnAccepting` exposes stable connection identity before TLS authentication. A server framework can therefore apply connection accounting, handshake concurrency limits, timeouts, logging, load shedding, and per-connection TLS policy before expensive TLS work.
 
-The application-facing option objects reuse `SslClientAuthenticationOptions` and `SslServerAuthenticationOptions`. Native providers must snapshot and validate those options. They may not silently ignore an unsupported property. A provider has three valid choices:
+The application-facing TLS option objects reuse `SslClientAuthenticationOptions` and `SslServerAuthenticationOptions`. Native providers must snapshot and validate those options. They may not silently ignore an unsupported property. A provider has three valid choices:
 
 1. implement the configured behavior;
 2. use the `Socket`/`SslStream` compatibility path when provider selection is automatic;
@@ -275,7 +275,7 @@ TLS callback ordering, buffer lifetime, and the detailed compatibility matrix ar
 - datagrams;
 - raw handle access;
 - arbitrary socket options and IOControl;
-- synchronous I/O;
+- blocking consumer read/write APIs;
 - polling/select;
 - sendfile and packet-specific operations.
 
@@ -284,7 +284,7 @@ It represents only the connected ordered-byte-stream lifetime needed by a provid
 The new abstraction is justified only by semantics that do not fit `Socket`:
 
 - a provider instance owns resources shared by many connections;
-- receive memory can be selected by a completion and leased to a consumer;
+- receive memory can be selected by a completion and delivered as a borrowed callback span;
 - the connection may be plaintext or a native TLS plaintext view over an encrypted socket;
 - terminal completion controls safe reuse of operation and buffer identities;
 - the provider may not have a managed `Socket` at all.
@@ -307,7 +307,7 @@ The semantic gaps and performance hypotheses are deliberately separated:
 
 `TransportConnection` names the semantic role: one provider-owned connected ordered byte stream. It is not called `Socket`, `Socket2`, `NativeSocket`, or `AsyncSocket` because it does not expose the BSD/Winsock socket contract, and because asynchronous implementation is not the identity of the type. `TransportProvider` names the object that owns a transport implementation and its shared resources. `TransportListener` is the provider-owned accept source.
 
-`TcpConnection` would be narrower but sits awkwardly beside the existing `TcpClient` and `TcpListener`, which expose a different object and ownership model. `StreamConnection` would imply an ordinary `Stream` rather than leased multi-segment reads. The proposed names should remain experimental; API review can rename them after the semantics, not the novelty, are proven.
+`TcpConnection` would be narrower but sits awkwardly beside the existing `TcpClient` and `TcpListener`, which expose a different object and ownership model. `StreamConnection` would imply a caller-driven `Stream`, while this connection receives through provider callbacks. The proposed names should remain experimental; API review can rename them after the semantics, not the novelty, are proven.
 
 ### Best counterargument
 
@@ -320,11 +320,11 @@ The strongest alternative is to add no new connection type:
 
 That alternative has major advantages: no ecosystem split, no duplicate ownership rules, complete compatibility with existing libraries, and freedom for runtime to change implementation without public provider contracts.
 
-The proposal therefore does **not** claim that a stable `TransportConnection` is already justified. It recommends an experimental runtime-owned package to determine whether the shared-provider and leased-buffer semantics produce material, repeatable gains and enable real non-Kestrel consumers. If they do not, the correct outcome is to keep the improvements behind `Socket` and `SslStream`.
+The proposal therefore does **not** claim that a stable `TransportConnection` is already justified. It recommends an experimental runtime-owned component to determine whether shared-provider ownership, callback buffers, provider-specific tuning, and native TLS produce material, repeatable gains and enable real non-Kestrel consumers. If they do not, the correct outcome is to keep the improvements behind `Socket` and `SslStream`.
 
 ### Socket interop and ownership
 
-The managed fallback accepts existing `Socket` instances with an explicit `ownsSocket` argument and returns the same socket only through provider-specific APIs. The common abstraction does not fabricate a `Socket` over a native fd.
+The managed provider creates and drives ordinary `Socket`/SAEA instances behind the same callback API. Existing-Socket adoption is not in the revised core surface yet; if added, it requires explicit exclusive-I/O and disposal ownership rather than exposing a second active owner.
 
 This avoids the sharp edge visible in the DirectTLS prototype: a non-owning `SafeSocketHandle` can be wrapped in `Socket`, but disposing that wrapper can still cancel its outstanding operations, and raw reads or writes bypassing TLS corrupt the record stream. See [S-DIRECTTLS](sources.md#s-directtls) and [S-RUNTIME-SOCKETS](sources.md#s-runtime-sockets).
 
@@ -344,14 +344,14 @@ See [backends.md](backends.md) for concrete mappings and unresolved io_uring cho
 
 ## Pipelines and Kestrel
 
-`TransportPipelines.Create` returns an owned `IDuplexPipe` adapter. It receives separate `PipeOptions` for the network-to-application and application-to-network directions, preserving the scheduler split Kestrel uses today.
+The Pipelines API is now deliberately **above** the callback core and is not part of the revised reference surface yet. A future `System.Net.Transport.Pipelines` adapter subscribes through a `TransportApplication` implementation and maps operation IDs to its own async waiters.
 
 The baseline adapter has two pumps:
 
-- receive pump: `TransportConnection.ReadAsync` -> copy or optimized adoption into the inbound `PipeWriter` -> await `FlushAsync` before requesting more input;
-- send pump: outbound `PipeReader.ReadAsync` -> `TransportConnection.WriteAsync` -> advance only after the write no longer retains source memory.
+- receive side: `OnReceive` copies or adopts the borrowed payload into the inbound `PipeWriter`; an incomplete `FlushAsync` pauses the connection before returning from the callback or as soon as the provider permits;
+- send side: an outbound `PipeReader` composes bytes through `TransportConnection`, calls `Flush`, and maps `TransportWriteOperation.Id` to `OnWriteCompleted`.
 
-Backpressure is real: when inbound `FlushAsync` pauses, the adapter stops requesting reads. A provider that has already armed multishot receives may receive bounded completions already in flight, but it must stop rearming or cancel/park the receive before its configured bound is exceeded.
+Backpressure remains real: the adapter calls `TryPauseReceive` when the application is behind and `ResumeReceive` after the flush drains. A provider that already armed multishot receives may deliver bounded completions already in flight, but it must stop rearming or cancel/park the receive before its configured bound is exceeded.
 
 The adapter distinguishes four scheduler roles through two `PipeOptions` instances:
 
@@ -360,7 +360,7 @@ The adapter distinguishes four scheduler roles through two `PipeOptions` instanc
 - outbound reader scheduler: resumes the transport send pump;
 - outbound writer scheduler: resumes Kestrel/application code producing output.
 
-For the current Kestrel-style default, application continuations use `PipeScheduler.ThreadPool`, while transport continuations use the selected transport scheduler or inline execution only when explicitly safe. This mirrors the current socket transport's direction-specific scheduling rather than collapsing everything onto one scheduler.
+For the current Kestrel-style default, application continuations use `PipeScheduler.ThreadPool`, while adapter work is scheduled so application code does not run on a provider loop unless explicitly requested. This preserves Kestrel's direction-specific scheduling intent.
 
 ASP.NET Core glue remains responsible for:
 
@@ -373,37 +373,36 @@ ASP.NET Core glue remains responsible for:
 
 ## Server and client usage
 
-The API document contains complete illustrative snippets. The essential server shape is:
+The API document and [`examples`](examples/README.md) contain complete illustrative snippets. The essential server shape is:
 
 ```csharp
-await using TransportProvider provider = new SocketTransportProvider();
-await using TransportListener listener = await provider.ListenAsync(
+TransportProvider provider = TransportProviders.CreateDefault();
+
+using TransportEngine engine = provider.CreateEngine(
+    new TransportEngineOptions(),
+    new EchoApplication());
+
+using TransportListener listener = engine.Listen(
     new TransportListenOptions
     {
         EndPoint = new IPEndPoint(IPAddress.Any, 8443),
         Backlog = 512,
         NoDelay = true,
-    },
-    shutdownToken);
-
-while (!shutdownToken.IsCancellationRequested)
-{
-    TransportConnection connection = await listener.AcceptAsync(shutdownToken);
-    _ = HandleConnectionAsync(connection, shutdownToken);
-}
+        Tls = serverTls,
+    });
 ```
 
-The same `TransportConnection` can then remain plaintext or authenticate as a TLS server. A client first connects and then authenticates with `SslClientAuthenticationOptions`, including normal target-host validation and optional client-certificate selection.
+The provider invokes `OnAccepting`, drives the selected TLS handshake, invokes `OnReady`, and then delivers `OnReceive` callbacks. A client calls synchronous `engine.Connect(options)` and receives success through `OnReady` or failure through `OnConnectFailed`; a higher-level adapter can turn that operation handle into `ConnectAsync`.
 
 For a Redis-style multiplexer, the provider is shared across many logical client connections. The protocol library owns request correlation, pooling, heartbeat, reconnect, and retry. The runtime transport owns only one physical connection, its I/O/TLS resources, and precise close/error notification. No throughput or latency advantage is asserted without measurements.
 
 ## Scheduling and callback isolation
 
-The provider may complete an operation synchronously. When it completes asynchronously, it must not invoke arbitrary application callbacks on a poller or completion loop that services unrelated connections.
+The provider may complete work while a submission call is still on the stack. Callback ordering and reentrancy are part of the contract: callbacks for one connection are serialized, and application code must not block a provider loop that services unrelated connections.
 
 TLS callbacks are serialized per connection and may run concurrently across connections. The provider does not hold its ring, epoll, completion-port, or TLS-session lock while invoking user code. A suspended handshake is represented explicitly and resumed on the owning backend context after the callback completes. The DirectTLS prototype's eventfd plus completion-queue pattern is one concrete feasibility example, not a mandated implementation.
 
-Application code must not reenter `ReadAsync`, `WriteAsync`, authentication, shutdown, or disposal on the same connection from a TLS callback. Metadata reads are allowed. Callback exceptions fail that connection's handshake and never downgrade it to plaintext.
+The raw ClientHello callback is synchronous and must remain bounded. The async TLS options callback may suspend only that connection's handshake and runs away from shared provider-loop locks. Neither callback may start application I/O before `OnReady`. Callback exceptions fail that connection's handshake and never downgrade it to plaintext.
 
 ## Offload model
 
@@ -469,12 +468,12 @@ Stabilize only the smallest surface demonstrated by at least two independent con
 
 The proposal should not be considered implementation-complete until all applicable criteria pass:
 
-1. Plaintext echo, half-close, abort, peer EOF, connect failure, accept cancellation, and listener disposal behave identically across providers.
-2. Exactly one read and one write can progress concurrently; a second same-direction operation fails deterministically.
-3. Every receive buffer remains valid until `AdvanceRead`, and no buffer ID or connection slot is reused before terminal completion.
+1. Plaintext echo, half-close, abort, peer EOF, connect failure, connect cancellation, and listener disposal behave identically across providers.
+2. Receive callbacks are serialized per connection, borrowed payload is valid for exactly the callback, and logical writes complete in submission order.
+3. No receive buffer ID or connection slot is reused before its callback and native terminal completion are finished.
 4. Every property in the current `SslClientAuthenticationOptions` and `SslServerAuthenticationOptions` surface is implemented, explicitly rejected, or routed to the documented `SslStream` fallback.
 5. Every Kestrel callback and feature in [tls.md](tls.md) has a passing parity test or an explicit bind-time incompatibility.
-6. Callback exceptions and cancellation fail only the affected handshake and never stall a shared backend loop.
+6. Application callback exceptions fail only the affected connection; application callbacks are documented as nonblocking provider-worker code, while async TLS option callbacks suspend only their handshake.
 7. `TlsClientHelloBytesCallback` compatibility preserves current first-record bytes and lifetime; `UseTlsClientHelloListener` can retain its separate pre-handshake timeout; fragmentation remains explicitly detectable.
 8. `Prefer` and `Require` kTLS tests cover TX-only, RX-only, both, and unavailable cases, with actual activation checked rather than inferred from configuration.
 9. Hardware TLS status is never reported active without provider evidence; unknown remains unknown.
@@ -492,7 +491,7 @@ The proposal should not be considered implementation-complete until all applicab
 - **kTLS can conflict with TLS features.** Renegotiation, record sizing, provider/FIPS requirements, protocol/cipher support, and key-update handling can prevent activation.
 - **Hardware TLS state may be unknowable per connection.** The API reports `Unknown` rather than inferring from NIC capability or aggregate counters.
 - **No raw handle transfer in v1.** Existing `Socket` adoption is limited to the managed provider until an atomic ownership-transfer design exists.
-- **No automatic backend choice in the stable contract.** An automatic policy can change behavior across machines and containers. The host or framework should choose a provider and record the actual choice.
+- **Automatic provider choice remains an explicit decision point.** `CreateDefault()` may select different behavior across machines and containers, so the created engine must report the actual provider and production hosts may choose one explicitly.
 
 ## Conclusion
 

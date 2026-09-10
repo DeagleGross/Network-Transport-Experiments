@@ -1,47 +1,384 @@
-# Proposed API and behavioral contracts
+# Proposed callback-first transport API
 
-> **Status:** Illustrative experimental API. Names, namespaces, assemblies, and signatures require runtime API review. This file is internally consistent with the examples in this proposal, but it is not a checked-in reference assembly.
+> **Status:** Revised design candidate. The API is illustrative, experimental, unapproved, and unimplemented.
+>
+> **Primary change from the first draft:** the low-level data plane no longer exposes `ReadAsync`, `WriteAsync`, `AcceptAsync`, or `AuthenticateAsServerAsync`. It uses synchronous submission and provider-owned callbacks. Task-based connect, Stream, Pipelines, and Kestrel APIs are adapters above this layer.
 
-## Design principles
+## Decision
 
-- The core abstraction is a connected, reliable, ordered byte stream, not an operating-system socket.
-- Provider instances own resources shared across connections.
-- Receive memory is leased from the provider and explicitly advanced.
-- Writes are all-or-error and retain source memory only until the returned operation completes.
-- TLS authentication is part of the connection lifecycle and reuses existing `SslClientAuthenticationOptions` and `SslServerAuthenticationOptions`.
-- The portable TLS implementation is `SslStream`; native providers use a shared runtime helper or their own native implementation only when they preserve configured semantics.
-- Public APIs do not expose epoll flags, SQEs, CQEs, OVERLAPPED pointers, OpenSSL handles, or kernel TLS socket options.
-- Provider-specific tuning belongs on provider-specific experimental types.
-- Abstract base classes, rather than interfaces, reserve space for shared implementation helpers and non-breaking virtual evolution while still allowing out-of-assembly providers.
+The core transport API should follow the useful part of SocketSet's model:
 
-## Candidate reference surface
+- one engine owns shared provider resources;
+- `Listen` and `Connect` synchronously submit control-plane work;
+- accept, connect, receive, write completion, TLS progression, and close are callbacks;
+- receive buffers are borrowed only for the callback;
+- a connection is stable identity, outbound writer, close control, backpressure control, and metadata;
+- TLS is selected as connection policy and driven by the engine/provider, not invoked as a high-level method on the connection;
+- async APIs are optional adapters.
+
+This does **not** make the implementation synchronous. epoll, io_uring, IOCP, RIO, SAEA, OpenSSL, and Schannel still have asynchronous state, operation identities, cancellation races, and terminal completions. The difference is where that state is represented: provider-owned slots and callbacks rather than one `Task`/`ValueTask` state machine per read and write.
+
+## Acceptance criteria for this API revision
+
+1. The core surface contains no task-based read, write, accept, or TLS-authentication method.
+2. A listener has an independent lifetime instead of being owned only by the whole engine.
+3. An outbound connection attempt has a first-class correlation and cancellation handle.
+4. A write submission has a first-class completion identity.
+5. Close notification carries phase, reason, and exception.
+6. Portable engine policy is separated from typed managed, epoll, io_uring, IOCP, and RIO provider options.
+7. ClientHello observation is a callback raised by the TLS handshake state machine, not a separate consumer invocation.
+8. Built-in provider implementations remain internal; consumers select them through one provider-level API.
+9. The managed provider uses ordinary `System.Net.Sockets.Socket` and `SocketAsyncEventArgs` while presenting exactly the same callbacks as native providers.
+10. Higher-level async and Pipelines adapters can be implemented without changing the core provider contract.
+
+## Assembly map
+
+The assembly placement is an incubation recommendation, not an approved runtime layout.
+
+| Assembly | Status | Responsibility |
+|---|---|---|
+| `System.Net.Sockets.dll` | Existing, unchanged | Public `Socket`, `SafeSocketHandle`, and SAEA APIs used by the managed provider |
+| `System.Net.Security.dll` | Existing | Incubation home for `System.Net.Transport` core/provider APIs and built-in providers, so native TLS can reuse existing OpenSSL/Schannel policy and PAL code without `InternalsVisibleTo` or `UnsafeAccessor` |
+| `System.Net.Transport.Pipelines.dll` | Proposed new optional assembly | Task/Pipelines adapters over the callback core |
+| ASP.NET Core Kestrel transport assembly/package | Existing ASP.NET Core layer | Maps Kestrel listener, connection, scheduler, feature, and timeout semantics to the runtime transport |
+
+Why incubate the transport in `System.Net.Security.dll`:
+
+- native TLS is a central requirement, not an optional wrapper;
+- the runtime's certificate normalization, validation, OpenSSL, Schannel, session, and channel-binding logic already lives there;
+- `System.Net.Security.dll` already depends on the socket stack;
+- putting a new framework assembly across that boundary would require either duplicated TLS policy or a separately reviewed public low-level TLS engine API.
+
+If the transport stabilizes, a dedicated `System.Net.Transport.dll` can be reconsidered after the TLS engine boundary is deliberately extracted. Namespace and assembly names do not need to match during incubation.
+
+## Layer boundaries
+
+```mermaid
+flowchart TB
+    App["Application or framework<br/>consumer code"]
+    Async["Async / Stream / Pipelines<br/>new optional adapter assembly"]
+    Core["Transport engine / callbacks<br/>System.Net.Transport<br/>System.Net.Security.dll"]
+    Provider["Provider selection / options<br/>System.Net.Transport.*<br/>System.Net.Security.dll"]
+    Managed["Managed Socket / SAEA<br/>internal implementation<br/>uses System.Net.Sockets.dll"]
+    Native["epoll / io_uring / IOCP / RIO<br/>internal implementations<br/>System.Net.Security.dll"]
+    Tls["OpenSSL / Schannel / kTLS<br/>internal implementations<br/>System.Net.Security.dll"]
+
+    App --> Core
+    App --> Async
+    Async --> Core
+    Core --> Provider
+    Provider --> Managed
+    Provider --> Native
+    Managed --> Tls
+    Native --> Tls
+
+    classDef consumer fill:#e8f4ff,stroke:#1976d2,color:#111
+    classDef existingAssembly fill:#e8f5e9,stroke:#2e7d32,color:#111
+    classDef newAssembly fill:#fff8e1,stroke:#f9a825,color:#111
+
+    class App consumer
+    class Async newAssembly
+    class Core,Provider,Managed,Native,Tls existingAssembly
+```
+
+Diagram colors show assembly placement: green is an existing runtime assembly, yellow is a proposed new optional adapter assembly, and blue is consumer code.
+
+The core API ends at callbacks and borrowed buffers. `Task`, `Stream`, and `IDuplexPipe` ownership begins in the adapter layer.
+
+## Proposed reference surface
+
+### Provider selection
+
+Built-in provider implementation classes remain internal. The public static factory gives callers typed configuration without exposing the implementation class itself.
 
 ```csharp
-using System.Buffers;
-using System.Diagnostics.CodeAnalysis;
-using System.Net.Security;
-using System.Security.Authentication;
-using System.Security.Authentication.ExtendedProtection;
-using System.Security.Cryptography.X509Certificates;
-
 namespace System.Net.Transport;
 
 [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public abstract class TransportProvider : IAsyncDisposable
+public static class TransportProviders
+{
+    public static TransportProvider CreateDefault();
+
+    public static TransportProvider ManagedSockets(
+        ManagedSocketTransportOptions? options = null);
+
+    [SupportedOSPlatform("linux")]
+    public static TransportProvider Epoll(
+        EpollTransportOptions? options = null);
+
+    [SupportedOSPlatform("linux")]
+    public static TransportProvider IoUring(
+        IoUringTransportOptions? options = null);
+
+    [SupportedOSPlatform("windows")]
+    public static TransportProvider WindowsIocp(
+        IocpTransportOptions? options = null);
+
+    [SupportedOSPlatform("windows")]
+    public static TransportProvider WindowsRio(
+        RioTransportOptions? options = null);
+}
+
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public abstract class TransportProvider
 {
     protected TransportProvider();
 
     public abstract string Name { get; }
+    public abstract bool IsSupported { get; }
 
-    public abstract ValueTask<TransportListener> ListenAsync(
-        TransportListenOptions options,
-        CancellationToken cancellationToken = default);
+    public abstract TransportEngine CreateEngine(
+        TransportEngineOptions options,
+        ITransportApplication application);
+}
+```
 
-    public abstract ValueTask<TransportConnection> ConnectAsync(
-        TransportConnectOptions options,
-        CancellationToken cancellationToken = default);
+`CreateDefault` probes every time it is called rather than returning one globally cached provider. Proposed default order:
 
-    public abstract ValueTask DisposeAsync();
+1. Windows IOCP;
+2. Linux io_uring when the required features are usable;
+3. Linux epoll;
+4. managed Socket.
+
+RIO is never selected automatically.
+
+### Portable engine options
+
+These options express policy shared by every provider. They deliberately exclude ring entries, epoll event batches, IOCP completion batches, RIO queue depth, and provider buffer-registration mechanics.
+
+```csharp
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public sealed class TransportEngineOptions
+{
+    public TransportEngineOptions();
+
+    public int InitialWorkerCount { get; set; }
+    public int MaximumWorkerCount { get; set; }
+    public int MaximumConnectionsPerWorker { get; set; } = 4096;
+    public bool PinWorkerThreads { get; set; }
+    public bool TrackEndpoints { get; set; } = true;
+    public TimeSpan IdleTimeout { get; set; }
+}
+```
+
+Semantics:
+
+- `InitialWorkerCount == 0` lets the selected provider choose.
+- `MaximumWorkerCount == 0` disables dynamic growth.
+- a provider may clamp worker count to its model; the managed provider uses one logical worker;
+- `MaximumConnectionsPerWorker` is a capacity policy, not a ring-entry or buffer-count setting;
+- provider-resolved values are readable from the created engine.
+
+### Typed provider options
+
+The first draft omitted these. The revised API makes them explicit and provider-specific.
+
+```csharp
+namespace System.Net.Transport.Sockets;
+
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public sealed class ManagedSocketTransportOptions
+{
+    public ManagedSocketTransportOptions();
+
+    public int ReceiveBufferSize { get; set; } = 4096;
+    public int WriteBufferSize { get; set; } = 4096;
+    public int WriteBufferCount { get; set; } = 1024;
+    public bool WaitForDataBeforeAllocatingBuffer { get; set; } = true;
+    public bool PreferInlineCompletions { get; set; }
+    public ManagedSocketTlsStrategy TlsStrategy { get; set; } =
+        ManagedSocketTlsStrategy.Auto;
+}
+
+public enum ManagedSocketTlsStrategy
+{
+    Auto = 0,
+    SslStream = 1,
+    PlatformFilter = 2,
+}
+
+namespace System.Net.Transport.Linux;
+
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public sealed class EpollTransportOptions
+{
+    public EpollTransportOptions();
+
+    public int MaximumEventsPerWait { get; set; } = 256;
+    public int ReadBurstLimit { get; set; } = 8;
+    public int WriteBurstLimit { get; set; } = 16;
+    public int ReceiveBufferSize { get; set; } = 4096;
+    public int WriteBufferSize { get; set; } = 4096;
+    public int WriteBufferCount { get; set; } = 1024;
+    public bool ReusePort { get; set; } = true;
+    public EpollTlsStrategy TlsStrategy { get; set; } = EpollTlsStrategy.Auto;
+}
+
+public enum EpollTlsStrategy
+{
+    Auto = 0,
+    SocketBoundOpenSsl = 1,
+    MemoryBio = 2,
+    SslStream = 3,
+}
+
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public sealed class IoUringTransportOptions
+{
+    public IoUringTransportOptions();
+
+    public int RingEntryCount { get; set; } = 4096;
+    public int ProvidedBufferCount { get; set; } = 256;
+    public int ReceiveBufferSize { get; set; } = 4096;
+    public int WriteBufferSize { get; set; } = 4096;
+    public int WriteBufferCount { get; set; } = 1024;
+    public int OutOfBandWriteBufferCount { get; set; } = 256;
+    public int MaximumBorrowedReceiveBuffers { get; set; } = 128;
+    public bool ReusePort { get; set; } = true;
+    public IoUringTlsStrategy TlsStrategy { get; set; } = IoUringTlsStrategy.Auto;
+}
+
+public enum IoUringTlsStrategy
+{
+    Auto = 0,
+    MemoryBio = 1,
+    SocketBoundPoll = 2,
+    SslStream = 3,
+}
+
+namespace System.Net.Transport.Windows;
+
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public sealed class IocpTransportOptions
+{
+    public IocpTransportOptions();
+
+    public int CompletionBatchSize { get; set; } = 128;
+    public int AcceptConcurrency { get; set; } = 32;
+    public int ReceiveBufferSize { get; set; } = 4096;
+    public int WriteBufferSize { get; set; } = 4096;
+    public int WriteBufferCount { get; set; } = 1024;
+    public WindowsTlsStrategy TlsStrategy { get; set; } = WindowsTlsStrategy.Auto;
+}
+
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public sealed class RioTransportOptions
+{
+    public RioTransportOptions();
+
+    public int CompletionQueueSize { get; set; } = 4096;
+    public int AcceptConcurrency { get; set; } = 32;
+    public int ReceiveBufferSize { get; set; } = 4096;
+    public int SendBufferSize { get; set; } = 65536;
+    public int RegisteredSendBufferCount { get; set; } = 256;
+    public WindowsTlsStrategy TlsStrategy { get; set; } = WindowsTlsStrategy.Auto;
+}
+
+public enum WindowsTlsStrategy
+{
+    Auto = 0,
+    Schannel = 1,
+    SslStream = 2,
+}
+```
+
+These are candidate experimental knobs, not a claim that every value should stabilize. They are present now because provider behavior cannot be meaningfully discussed without the resources and strategy being selected. The API review later in this document recommends validating which knobs have real user scenarios before stabilization.
+
+### Application callbacks
+
+The application object is separate from the engine so one object does not simultaneously represent provider resources, listener lifetime, callbacks, and user protocol state.
+
+```csharp
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public interface ITransportApplication
+{
+    void OnAccepting(ref TransportAcceptingContext context);
+    void OnReady(ref TransportReadyContext context);
+    void OnConnectFailed(ref TransportConnectFailedContext context);
+    void OnReceive(ref TransportReceiveContext context);
+    void OnWriteCompleted(ref TransportWriteCompletedContext context);
+    void OnClosed(ref TransportClosedContext context);
+    void OnListenerClosed(ref TransportListenerClosedContext context);
+    void OnWorkerFaulted(ref TransportWorkerFaultedContext context);
+    void OnBatchCompleted(int workerIndex);
+}
+
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public abstract class TransportApplication : ITransportApplication
+{
+    protected TransportApplication();
+
+    protected virtual void OnAccepting(
+        ref TransportAcceptingContext context);
+
+    protected virtual void OnReady(
+        ref TransportReadyContext context);
+
+    protected virtual void OnConnectFailed(
+        ref TransportConnectFailedContext context);
+
+    protected virtual void OnReceive(
+        ref TransportReceiveContext context);
+
+    protected virtual void OnWriteCompleted(
+        ref TransportWriteCompletedContext context);
+
+    protected virtual void OnClosed(
+        ref TransportClosedContext context);
+
+    protected virtual void OnListenerClosed(
+        ref TransportListenerClosedContext context);
+
+    protected virtual void OnWorkerFaulted(
+        ref TransportWorkerFaultedContext context);
+
+    protected virtual void OnBatchCompleted(
+        int workerIndex);
+
+    void ITransportApplication.OnAccepting(ref TransportAcceptingContext context);
+    void ITransportApplication.OnReady(ref TransportReadyContext context);
+    void ITransportApplication.OnConnectFailed(ref TransportConnectFailedContext context);
+    void ITransportApplication.OnReceive(ref TransportReceiveContext context);
+    void ITransportApplication.OnWriteCompleted(ref TransportWriteCompletedContext context);
+    void ITransportApplication.OnClosed(ref TransportClosedContext context);
+    void ITransportApplication.OnListenerClosed(ref TransportListenerClosedContext context);
+    void ITransportApplication.OnWorkerFaulted(ref TransportWorkerFaultedContext context);
+    void ITransportApplication.OnBatchCompleted(int workerIndex);
+}
+```
+
+Providers invoke the public `ITransportApplication` contract. Most consumers derive from `TransportApplication`, which explicitly implements that interface and offers protected virtual methods so only the callbacks they need must be overridden.
+
+Callback rules:
+
+- callbacks for one connection are serialized on its owning provider context;
+- callbacks for different connections may run concurrently;
+- callback buffers are borrowed and cannot escape the callback;
+- an exception from application code fails only that connection and is reported through `OnClosed`;
+- `OnWorkerFaulted` is reserved for a provider-wide worker failure;
+- `OnBatchCompleted` permits protocol adapters to coalesce work at provider-batch granularity.
+
+### Engine and listener lifetime
+
+Control-plane creation is synchronous. It may allocate native resources and start workers, and it fails before returning.
+
+```csharp
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public abstract class TransportEngine : IDisposable
+{
+    protected TransportEngine();
+
+    public abstract TransportProvider Provider { get; }
+    public abstract TransportEngineOptions Options { get; }
+    public abstract int WorkerCount { get; }
+
+    public abstract TransportListener Listen(
+        TransportListenOptions options);
+
+    public abstract TransportConnectOperation Connect(
+        TransportConnectOptions options);
+
+    public abstract void Dispose();
 }
 
 [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
@@ -52,8 +389,36 @@ public sealed class TransportListenOptions
     public required IPEndPoint EndPoint { get; init; }
     public int Backlog { get; set; } = 512;
     public bool NoDelay { get; set; } = true;
+    public object? State { get; init; }
+    public TransportServerTlsOptions? Tls { get; set; }
 }
 
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public abstract class TransportListener : IDisposable
+{
+    protected TransportListener();
+
+    public abstract long Id { get; }
+    public abstract IPEndPoint LocalEndPoint { get; }
+    public abstract object? State { get; }
+    public abstract bool IsAccepting { get; }
+
+    public abstract void Dispose();
+}
+```
+
+`Listen` returns only after bind, listen, provider registration, and accept arming succeed. Disposing a listener:
+
+- stops new accepts;
+- waits for accept operations owned by that listener to reach terminal state;
+- does not close connections already delivered through `OnAccepting`;
+- triggers `OnListenerClosed` once.
+
+`TransportEngine.Dispose` synchronously stops every listener, aborts remaining connections, drains provider operation state, joins provider workers, and then returns. It must not be called from a provider callback; doing so throws `InvalidOperationException`. A higher-level host can wrap blocking shutdown in its own async lifetime if needed.
+
+### Connect submission and correlation
+
+```csharp
 [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
 public sealed class TransportConnectOptions
 {
@@ -62,995 +427,476 @@ public sealed class TransportConnectOptions
     public required EndPoint RemoteEndPoint { get; init; }
     public IPEndPoint? LocalEndPoint { get; init; }
     public bool NoDelay { get; set; } = true;
+    public int? RequiredWorkerIndex { get; init; }
+    public object? State { get; init; }
+    public TransportClientTlsOptions? Tls { get; set; }
 }
 
 [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public abstract class TransportListener : IAsyncDisposable
+public readonly struct TransportConnectOperation :
+    IEquatable<TransportConnectOperation>
 {
-    protected TransportListener();
+    public long Id { get; }
+    public object? State { get; }
+    public bool IsValid { get; }
 
-    public abstract IPEndPoint LocalEndPoint { get; }
+    public bool Cancel();
+}
+```
 
-    public abstract ValueTask<TransportConnection> AcceptAsync(
-        CancellationToken cancellationToken = default);
+`Connect` is a synchronous submission:
 
-    public abstract ValueTask DisposeAsync();
+- it validates the endpoint and required worker;
+- reserves provider capacity;
+- creates or queues the native connect operation;
+- returns a value-type operation handle.
+
+Completion:
+
+- success produces `OnReady` with both the operation and the ready connection;
+- connect, TLS, cancellation, or provider failure before readiness produces `OnConnectFailed`;
+- `Cancel` requests cancellation but the provider retains native state until its terminal completion;
+- one operation callback is produced exactly once.
+
+This fixes SocketSet's current `void Connect(...)` correlation gap without requiring a `Task` in the core.
+
+### Pre-handshake accept and post-handshake ready phases
+
+An accepted TCP connection is visible before TLS so frameworks can count, reject, tag, and apply handshake limits before expensive authentication.
+
+```csharp
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public ref struct TransportAcceptingContext
+{
+    public TransportListener Listener { get; }
+    public TransportConnection Connection { get; }
+
+    public TransportServerTlsOptions? Tls { get; set; }
+
+    public void Reject(Exception? error = null);
+}
+
+public enum TransportConnectionOrigin
+{
+    Accepted = 0,
+    Connected = 1,
 }
 
 [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public abstract class TransportConnection : IAsyncDisposable
+public ref struct TransportReadyContext
+{
+    public TransportConnection Connection { get; }
+    public TransportConnectionOrigin Origin { get; }
+    public TransportListener? Listener { get; }
+    public TransportConnectOperation ConnectOperation { get; }
+
+    public Span<byte> GetWriteSpan(int sizeHint = 0);
+    public int WriteBytes { get; set; }
+}
+```
+
+Lifecycle:
+
+1. TCP accept creates connection identity.
+2. `OnAccepting` runs before TLS.
+3. The callback may reject, change the preseeded TLS policy, or leave it plaintext.
+4. If TLS is selected, the provider drives the handshake and its registered ClientHello/options callbacks.
+5. `OnReady` runs only after plaintext selection or successful TLS authentication.
+6. `OnReceive` begins only after `OnReady` returns.
+
+For outbound connections, `OnReady` is raised after TCP connect and any configured TLS handshake.
+
+### Connection API
+
+The connection has no read method. Receive belongs to the provider and is delivered through `OnReceive`.
+
+```csharp
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public abstract class TransportConnection : IBufferWriter<byte>
 {
     protected TransportConnection();
 
+    public abstract long Id { get; }
+    public abstract object? State { get; set; }
     public abstract IPEndPoint? LocalEndPoint { get; }
     public abstract IPEndPoint? RemoteEndPoint { get; }
-    public abstract Task Completion { get; }
+    public abstract TransportConnectionOrigin Origin { get; }
     public abstract TransportTlsInfo? TlsInfo { get; }
 
-    public abstract ValueTask<TransportReadResult> ReadAsync(
-        CancellationToken cancellationToken = default);
+    public abstract bool SupportsReceivePause { get; }
+    public abstract bool TryPauseReceive();
+    public abstract void ResumeReceive();
 
-    public abstract void AdvanceRead(
-        SequencePosition consumed,
-        SequencePosition examined);
+    public abstract Span<byte> GetSpan(int sizeHint = 0);
+    public abstract Memory<byte> GetMemory(int sizeHint = 0);
+    public abstract void Advance(int count);
 
-    public abstract ValueTask WriteAsync(
-        ReadOnlySequence<byte> buffer,
-        CancellationToken cancellationToken = default);
+    public abstract TransportWriteOperation Flush(
+        object? state = null);
 
-    public abstract ValueTask ObserveTlsClientHelloAsync(
-        TransportClientHelloCallback callback,
-        CancellationToken cancellationToken = default);
+    public virtual TransportWriteOperation Send(
+        ReadOnlySpan<byte> data,
+        object? state = null);
 
-    public abstract ValueTask<TransportTlsInfo> AuthenticateAsClientAsync(
-        TransportClientAuthenticationOptions options,
-        CancellationToken cancellationToken = default);
+    public virtual TransportWriteOperation Send(
+        in ReadOnlySequence<byte> data,
+        object? state = null);
 
-    public abstract ValueTask<TransportTlsInfo> AuthenticateAsServerAsync(
-        TransportServerAuthenticationOptions options,
-        CancellationToken cancellationToken = default);
-
-    public abstract Task<X509Certificate2?> RequestClientCertificateAsync(
-        CancellationToken cancellationToken = default);
-
-    public abstract ValueTask ShutdownWriteAsync(
-        CancellationToken cancellationToken = default);
-
+    public abstract void ShutdownRead();
+    public abstract void ShutdownWrite();
     public abstract void Abort(Exception? error = null);
-
-    public abstract ValueTask DisposeAsync();
 }
 
 [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public readonly struct TransportReadResult
+public readonly struct TransportWriteOperation :
+    IEquatable<TransportWriteOperation>
 {
-    public TransportReadResult(
-        ReadOnlySequence<byte> buffer,
-        bool isCompleted);
+    public long Id { get; }
+    public object? State { get; }
+    public bool IsValid { get; }
+}
+```
 
-    public ReadOnlySequence<byte> Buffer { get; }
+Write contract:
+
+- `GetSpan`/`GetMemory` return provider-owned outbound memory;
+- `Advance` commits bytes to the current composition;
+- `Flush` submits one logical write and returns its correlation handle;
+- `Send` copies into provider-owned memory and flushes;
+- writes are ordered;
+- `OnWriteCompleted` fires once per logical flush after all partial native writes complete;
+- the callback carries success or failure and the original operation/state;
+- only one application writer may compose bytes at a time;
+- providers may queue multiple completed compositions, but they retain ownership and ordering.
+
+This avoids exposing a task while still giving an async adapter enough identity to complete the correct waiter.
+
+### Receive and write callbacks
+
+```csharp
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public ref struct TransportReceiveContext
+{
+    public TransportConnection Connection { get; }
+    public ReadOnlySpan<byte> Payload { get; }
     public bool IsCompleted { get; }
+
+    public Span<byte> GetResponseSpan(int sizeHint = 0);
+    public int ResponseBytes { get; set; }
+    public void StopReceiving();
 }
 
 [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public sealed class TransportClientAuthenticationOptions
+public ref struct TransportWriteCompletedContext
 {
-    public TransportClientAuthenticationOptions();
+    public TransportConnection Connection { get; }
+    public TransportWriteOperation Operation { get; }
+    public Exception? Error { get; }
+
+    public Span<byte> GetWriteSpan(int sizeHint = 0);
+    public int WriteBytes { get; set; }
+}
+```
+
+Receive contract:
+
+- `Payload` is borrowed for the callback and cannot be retained;
+- `IsCompleted` means no later receive callback will carry payload;
+- writing an immediate response into `GetResponseSpan` avoids an additional composition step;
+- `ResponseBytes` may not exceed the returned span;
+- no public unwiped-buffer escape hatch is proposed;
+- slow-consumer adapters call `TryPauseReceive` and later `ResumeReceive`;
+- provider-specific already-completed receive work remains bounded by provider options.
+
+### Close and failure callbacks
+
+```csharp
+public enum TransportConnectionPhase
+{
+    Connecting = 0,
+    Accepting = 1,
+    Handshaking = 2,
+    Ready = 3,
+    Closing = 4,
+}
+
+public enum TransportCloseReason
+{
+    LocalShutdown = 0,
+    LocalAbort = 1,
+    PeerClosed = 2,
+    PeerReset = 3,
+    ConnectFailed = 4,
+    TlsHandshakeFailed = 5,
+    Timeout = 6,
+    ProviderStopped = 7,
+    Error = 8,
+}
+
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public readonly ref struct TransportConnectFailedContext
+{
+    public TransportConnectOperation Operation { get; }
+    public Exception Error { get; }
+}
+
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public readonly ref struct TransportClosedContext
+{
+    public TransportConnection Connection { get; }
+    public TransportConnectionPhase Phase { get; }
+    public TransportCloseReason Reason { get; }
+    public Exception? Error { get; }
+}
+
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public readonly ref struct TransportListenerClosedContext
+{
+    public TransportListener Listener { get; }
+    public Exception? Error { get; }
+}
+
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public readonly ref struct TransportWorkerFaultedContext
+{
+    public int WorkerIndex { get; }
+    public Exception Error { get; }
+}
+```
+
+Unlike SocketSet's `OnClosed(Connection)`, this preserves the terminal reason. A connection that reached `OnAccepting` always reaches `OnClosed`, even when TLS fails before `OnReady`. A failed outbound attempt that never created application-visible connection identity reaches `OnConnectFailed`.
+
+### Worker affinity
+
+```csharp
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public static class TransportExecutionContext
+{
+    public static int CurrentWorkerIndex { get; }
+}
+```
+
+`CurrentWorkerIndex` is `-1` outside a provider-owned callback or for a callback-driven provider that cannot expose stable worker affinity. `TransportConnectOptions.RequiredWorkerIndex` permits proxy implementations to place an outbound connection on the current native worker. A provider that cannot honor an explicit required worker fails the connect submission rather than silently changing placement.
+
+## TLS configuration is callback-driven
+
+The connection has no `AuthenticateAsServerAsync` or `AuthenticateAsClientAsync`.
+
+TLS is configured on the listener, connect options, or `OnAccepting` context. The engine drives the handshake before `OnReady`.
+
+Condensed transport-facing configuration:
+
+```csharp
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public sealed class TransportClientTlsOptions
+{
+    public TransportClientTlsOptions();
 
     public required SslClientAuthenticationOptions AuthenticationOptions { get; init; }
     public TransportTlsOffloadOptions Offload { get; init; } = new();
 }
 
 [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public sealed class TransportServerAuthenticationOptions
+public sealed class TransportServerTlsOptions
 {
-    public TransportServerAuthenticationOptions();
+    public TransportServerTlsOptions();
 
     public required SslServerAuthenticationOptions AuthenticationOptions { get; init; }
     public TransportClientHelloCallback? ClientHelloCallback { get; init; }
     public TransportServerOptionsSelectionCallback? OptionsSelectionCallback { get; init; }
+    public TimeSpan ClientHelloTimeout { get; set; } = TimeSpan.FromSeconds(8);
+    public TimeSpan HandshakeTimeout { get; set; } = TimeSpan.FromSeconds(10);
     public bool AllowPostHandshakeClientAuthentication { get; init; }
     public TransportTlsOffloadOptions Offload { get; init; } = new();
 }
 
-[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public delegate ValueTask TransportClientHelloCallback(
-    TransportServerHandshakeContext context,
-    CancellationToken cancellationToken);
+public delegate void TransportClientHelloCallback(
+    ref TransportClientHelloContext context);
 
-[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public delegate ValueTask<SslServerAuthenticationOptions> TransportServerOptionsSelectionCallback(
-    TransportServerHandshakeContext context,
-    SslServerAuthenticationOptions defaultOptions,
-    CancellationToken cancellationToken);
+public delegate ValueTask<SslServerAuthenticationOptions>
+    TransportServerOptionsSelectionCallback(
+        TransportServerOptionsSelectionContext context,
+        CancellationToken cancellationToken);
 
-[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public sealed class TransportServerHandshakeContext
+public readonly ref struct TransportClientHelloContext
 {
-    public TransportServerHandshakeContext(
-        TransportConnection connection,
-        SslClientHelloInfo clientHelloInfo,
-        ReadOnlySequence<byte> firstRecordBytes,
-        bool containsCompleteClientHello);
-
     public TransportConnection Connection { get; }
     public SslClientHelloInfo ClientHelloInfo { get; }
     public ReadOnlySequence<byte> FirstRecordBytes { get; }
     public bool ContainsCompleteClientHello { get; }
 }
 
-[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public sealed class TransportTlsOffloadOptions
+public sealed class TransportServerOptionsSelectionContext
 {
-    public TransportTlsOffloadOptions();
+    internal TransportServerOptionsSelectionContext();
 
-    public TlsOffloadPolicy Transmit { get; set; }
-    public TlsOffloadPolicy Receive { get; set; }
-}
-
-[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public enum TlsOffloadPolicy
-{
-    Disabled = 0,
-    Prefer = 1,
-    Require = 2,
-}
-
-[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public abstract class TransportTlsInfo
-{
-    protected TransportTlsInfo();
-
-    public abstract SslProtocols Protocol { get; }
-    public abstract TlsCipherSuite? NegotiatedCipherSuite { get; }
-    public abstract SslApplicationProtocol ApplicationProtocol { get; }
-    public abstract string? ServerName { get; }
-    public abstract X509Certificate2? RemoteCertificate { get; }
-    public abstract TransportTlsOffloadInfo Offload { get; }
-
-    public abstract bool TryGetChannelBindingBytes(
-        ChannelBindingKind kind,
-        out ReadOnlyMemory<byte> channelBindingToken);
-}
-
-[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public sealed class TransportTlsOffloadInfo
-{
-    public TransportTlsOffloadInfo(
-        TransportTlsOffloadDirectionInfo transmit,
-        TransportTlsOffloadDirectionInfo receive);
-
-    public TransportTlsOffloadDirectionInfo Transmit { get; }
-    public TransportTlsOffloadDirectionInfo Receive { get; }
-}
-
-[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public readonly struct TransportTlsOffloadDirectionInfo
-{
-    public TransportTlsOffloadDirectionInfo(
-        TlsOffloadPolicy requestedPolicy,
-        bool kernelRecordLayerActive,
-        TlsHardwareOffloadStatus hardwareOffload,
-        TlsOffloadFallbackReason fallbackReason);
-
-    public TlsOffloadPolicy RequestedPolicy { get; }
-    public bool KernelRecordLayerActive { get; }
-    public TlsHardwareOffloadStatus HardwareOffload { get; }
-    public TlsOffloadFallbackReason FallbackReason { get; }
-}
-
-[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public enum TlsHardwareOffloadStatus
-{
-    NotApplicable = 0,
-    Inactive = 1,
-    Active = 2,
-    Unknown = 3,
-}
-
-[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public enum TlsOffloadFallbackReason
-{
-    None = 0,
-    ProviderBuild = 1,
-    OperatingSystem = 2,
-    Kernel = 3,
-    Protocol = 4,
-    CipherSuite = 5,
-    TlsFeature = 6,
-    Backend = 7,
-    Unknown = 8,
+    public TransportConnection Connection { get; }
+    public SslClientHelloInfo ClientHelloInfo { get; }
+    public SslServerAuthenticationOptions DefaultOptions { get; }
 }
 ```
 
-The provider-specific managed fallback is the only implementation type proposed for the first experimental increment:
+The raw ClientHello callback is synchronous and executes inside the handshake state transition. It is suitable for JA4 input capture and other bounded observation. The async options callback may suspend the handshake for certificate or policy selection.
 
-```csharp
-using System.Diagnostics.CodeAnalysis;
-using System.Net.Sockets;
-using System.Net.Transport;
+`ClientHelloTimeout` bounds reaching and completing the raw callback phase. `HandshakeTimeout` bounds the remaining handshake, including async option selection. This preserves Kestrel's two timeout phases without a separate public `ObserveTlsClientHelloAsync` operation.
 
-namespace System.Net.Transport.Sockets;
+For fd-bound OpenSSL:
 
-[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public sealed class SocketTransportProvider : TransportProvider
-{
-    public SocketTransportProvider();
+1. `SSL_do_handshake` reads through the nonblocking socket BIO.
+2. OpenSSL's ClientHello callback runs after parsing the ClientHello.
+3. the runtime invokes `ClientHelloCallback`;
+4. if async option selection is required, the TLS engine suspends and returns a retry state;
+5. the provider changes epoll/poll interest according to the TLS operation result and resumes the same handshake later.
 
-    public override string Name { get; }
+No memory BIO or raw socket peek is required for the ClientHello callback.
 
-    public TransportConnection CreateConnection(
-        Socket socket,
-        bool ownsSocket);
+The exact internal OpenSSL/Schannel TLS-session API is not proposed as public transport API here. It remains in `System.Net.Security.dll` and is driven by built-in providers. If third-party providers need the same native TLS engine, that lower-level security API requires a separate public API review.
 
-    public TransportListener CreateListener(
-        Socket socket,
-        bool ownsSocket);
+## How the managed Socket provider fits
 
-    public override ValueTask<TransportListener> ListenAsync(
-        TransportListenOptions options,
-        CancellationToken cancellationToken = default);
+The managed provider is not a wrapper above a different connection model. It is one implementation of the same callback engine.
 
-    public override ValueTask<TransportConnection> ConnectAsync(
-        TransportConnectOptions options,
-        CancellationToken cancellationToken = default);
+```mermaid
+flowchart LR
+    Select["TransportProviders.ManagedSockets"]
+    Engine["TransportEngine"]
+    Socket["System.Net.Sockets.Socket"]
+    Saea["SocketAsyncEventArgs"]
+    Callbacks["TransportApplication callbacks"]
+    Tls["Internal TLS engine or SslStream path"]
 
-    public override ValueTask DisposeAsync();
-}
+    Select --> Engine
+    Engine --> Socket
+    Socket --> Saea
+    Saea --> Callbacks
+    Engine --> Tls
 ```
 
-The reusable Pipelines adapter is a companion layer:
+Mapping:
 
-```csharp
-using System.IO.Pipelines;
-using System.Net.Transport;
-
-namespace System.Net.Transport.Pipelines;
-
-[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public sealed class TransportPipeOptions
-{
-    public TransportPipeOptions();
-
-    public PipeOptions InputOptions { get; set; } = PipeOptions.Default;
-    public PipeOptions OutputOptions { get; set; } = PipeOptions.Default;
-    public bool LeaveOpen { get; set; }
-}
-
-[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public sealed class TransportDuplexPipe : IDuplexPipe, IAsyncDisposable
-{
-    public PipeReader Input { get; }
-    public PipeWriter Output { get; }
-    public Task Completion { get; }
-
-    public ValueTask DisposeAsync();
-}
-
-[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public static class TransportPipelines
-{
-    public static TransportDuplexPipe Create(
-        TransportConnection connection,
-        TransportPipeOptions? options = null);
-}
-```
-
-Illustrative native provider packages can derive from the same core without adding backend switches to the common options:
-
-```csharp
-using System.Diagnostics.CodeAnalysis;
-using System.Runtime.Versioning;
-using System.Net.Transport;
-
-namespace System.Net.Transport.Linux
-{
-    [SupportedOSPlatform("linux")]
-    [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-    public sealed class EpollTransportProvider : TransportProvider
-    {
-        public EpollTransportProvider();
-
-        public override string Name { get; }
-        public override ValueTask<TransportListener> ListenAsync(TransportListenOptions options, CancellationToken cancellationToken = default);
-        public override ValueTask<TransportConnection> ConnectAsync(TransportConnectOptions options, CancellationToken cancellationToken = default);
-        public override ValueTask DisposeAsync();
-    }
-
-    [SupportedOSPlatform("linux")]
-    [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-    public sealed class IoUringTransportProvider : TransportProvider
-    {
-        public IoUringTransportProvider();
-
-        public override string Name { get; }
-        public override ValueTask<TransportListener> ListenAsync(TransportListenOptions options, CancellationToken cancellationToken = default);
-        public override ValueTask<TransportConnection> ConnectAsync(TransportConnectOptions options, CancellationToken cancellationToken = default);
-        public override ValueTask DisposeAsync();
-    }
-}
-
-namespace System.Net.Transport.Windows
-{
-    [SupportedOSPlatform("windows")]
-    [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-    public sealed class IocpTransportProvider : TransportProvider
-    {
-        public IocpTransportProvider();
-
-        public override string Name { get; }
-        public override ValueTask<TransportListener> ListenAsync(TransportListenOptions options, CancellationToken cancellationToken = default);
-        public override ValueTask<TransportConnection> ConnectAsync(TransportConnectOptions options, CancellationToken cancellationToken = default);
-        public override ValueTask DisposeAsync();
-    }
-}
-```
-
-These native implementation type names are placeholders. They should not be stabilized until the implementations and their selection policy are proven.
-
-## Assembly placement
-
-The experimental phase should place the `System.Net.Transport` and `System.Net.Transport.Sockets` namespaces in `System.Net.Security.dll`. That assembly already owns `SslStream`, TLS option normalization, certificate validation, OpenSSL/Schannel PALs, and a dependency on sockets. Keeping the new implementation there avoids both duplicated TLS policy and prohibited cross-framework `InternalsVisibleTo` or `UnsafeAccessor` access. Namespace and assembly name do not need to match.
-
-`System.Net.Transport.Pipelines` should be a companion assembly that depends on `System.Net.Security` and `System.IO.Pipelines`. Kestrel references the transport and adapter assemblies; runtime never references ASP.NET Core.
-
-If later evidence supports splitting a dedicated `System.Net.Transport` assembly, the prerequisite is a deliberate extraction of the reusable TLS engine and policy into a lower dependency layer or a separately reviewed public contract. The split must not be implemented by granting a new friend-assembly boundary to reach `System.Net.Security` internals.
-
-Native Linux and Windows providers remain runtime-built implementation types until their support policy is established. The design does not require a third-party native dependency in the shared framework.
-
-## Consumer API versus backend SPI
-
-The same abstract types have two clearly separated roles:
-
-| Role | Surface used |
+| Core operation | Managed implementation |
 |---|---|
-| Consumer creates or receives a provider | Concrete provider constructor or dependency injection |
-| Consumer listens/connects | `ListenAsync`, `AcceptAsync`, `ConnectAsync` and the two TCP option types |
-| Consumer performs I/O | `ReadAsync`, `AdvanceRead`, `WriteAsync`, `ShutdownWriteAsync`, `Abort`, `Completion` |
-| Consumer configures TLS | Existing `Ssl*AuthenticationOptions` wrapped by transport authentication options |
-| Consumer uses Pipelines | `TransportPipelines.Create` and the owned `TransportDuplexPipe` |
-| Provider implementation | Derives `TransportProvider`, `TransportListener`, `TransportConnection`, and `TransportTlsInfo`; constructs `TransportReadResult`, handshake contexts, and offload result values |
+| `Listen` | Create/bind/listen ordinary `Socket`; arm `Socket.AcceptAsync(SocketAsyncEventArgs)` |
+| `Connect` | Create ordinary `Socket`; use SAEA connect completion; map the returned operation handle to that SAEA |
+| receive callback | One SAEA receive buffer per connection; invoke `OnReceive` from completion processing |
+| write composition | Provider-owned pooled arrays or pinned memory behind `IBufferWriter<byte>` |
+| write completion | One logical operation tracked across partial `Socket.SendAsync` completions, then `OnWriteCompleted` |
+| receive pause | Do not arm the next SAEA receive |
+| abort | Dispose the Socket, retain SAEA state until callbacks are terminal |
+| TLS | Use the same listener/connect TLS configuration and callbacks; implementation may choose the exact `SslStream` compatibility path or the runtime's internal OpenSSL/Schannel transform |
+| worker affinity | `CurrentWorkerIndex == -1`; explicit required-worker connect is rejected |
 
-The SPI is not a second set of submission/completion APIs. Providers translate their own epoll, SQE/CQE, SAEA, OVERLAPPED, OpenSSL, or Schannel state into the abstract operations and lifetime invariants. The public consumer never handles backend operation IDs.
+This is the same consumer API as epoll, io_uring, IOCP, and RIO. The managed provider is therefore a compatibility provider and the benchmark control, not an adapter pretending to be a native engine.
 
-An out-of-assembly provider is possible, but it receives no privileged access to runtime TLS internals. Such a provider either uses public `SslStream` over its connection adapter or implements TLS fully itself. Built-in runtime providers may share internal TLS policy because they live in the owning assembly.
+## How provider-specific use differs
 
-## Member-by-member necessity
-
-| Member | Why it exists |
-|---|---|
-| `TransportProvider` | Represents resources shared across connections: poller/ring/completion port, worker ownership, buffer pools, fixed files, and dispatch queues. A per-connection `Socket` cannot express this ownership boundary. An abstract base leaves room for shared helpers and non-breaking virtual additions. |
-| Protected constructors on abstract contract types | Allow provider subclasses while preventing meaningless direct construction of an incomplete provider, listener, connection, or TLS-info base. |
-| `Name` | Stable diagnostics and test output need to report the implementation actually selected. It is not used for behavioral branching. |
-| `ListenAsync` | Binds and initializes backend resources that may fail asynchronously, including native registration. |
-| `ConnectAsync` | Gives client libraries the same provider and connection model as servers. Completion means the underlying byte stream is connected, not TLS-authenticated. |
-| Provider `DisposeAsync` | Stops listeners, aborts owned connections, drains terminal completions, and releases shared native memory safely. |
-| `TransportListenOptions` constructor | Supports the standard required-property options pattern without constructor-overload growth. |
-| `TransportListenOptions.EndPoint` | Uses `IPEndPoint` because the proposed first surface is specifically TCP over IP, not generic endpoint extensibility. |
-| `Backlog` | Portable TCP listener behavior needed by Kestrel and other servers. |
-| `NoDelay` | Portable TCP behavior used by low-latency servers and clients. It is applied to accepted/connected sockets. |
-| `TransportConnectOptions` constructor | Supports the standard required-property options pattern without constructor-overload growth. |
-| `TransportConnectOptions.RemoteEndPoint` | Required target; the first contract accepts `IPEndPoint` and `DnsEndPoint`, rejecting other endpoint kinds. |
-| `TransportConnectOptions.LocalEndPoint` | Supports explicit source binding without exposing the whole socket API. |
-| `TransportListener` | Separates listener lifetime from provider lifetime and accepted connection lifetime. An abstract base leaves room for common helpers and non-breaking virtual additions. |
-| `TransportListener.LocalEndPoint` | Reports the actual bound endpoint, including an ephemeral port selected by the OS. |
-| `AcceptAsync` | Returns one raw connected byte stream. TLS is explicit so a failed client handshake does not terminate the listener or ambiguously fault an accept stream. |
-| `TransportConnection` | Defines the narrow post-connect stream and lifetime contract while leaving provider mechanics behind an abstract base that can share implementation helpers. |
-| `TransportConnection.LocalEndPoint`/`RemoteEndPoint` | Common metadata needed by servers, clients, admission checks, metrics, and diagnostics. Values come from the connected transport, not merely copied arguments. |
-| `Completion` | A reusable terminal signal for peer close, abort, and provider failure; required by long-lived clients and adapters without allocating one waiter per observation. |
-| `TlsInfo` | Publishes immutable post-handshake facts. Configuration and actual outcome are deliberately separate. |
-| `ReadAsync` | Returns provider-owned data without requiring a caller buffer, preserving io_uring provided-buffer identity and allowing multi-segment batches. |
-| `AdvanceRead` | Defines exactly when provider memory may be returned to a ring or pool and communicates consumed/examined positions for backpressure. |
-| `WriteAsync(ReadOnlySequence<byte>)` | Supports segmented Pipelines output and scatter/gather backends without forcing coalescing. Completion defines source-memory release. |
-| `ObserveTlsClientHelloAsync` | Lets a server observe the first ClientHello record under a separate timeout before authentication, preserving Kestrel's `UseTlsClientHelloListener` phase. The provider retains the bytes for the later handshake. |
-| `AuthenticateAsClientAsync`/`AuthenticateAsServerAsync` | Makes TLS a first-class lifecycle operation. The managed provider is the compatibility implementation; native providers may call a shared runtime `SslStream` adapter or implement the full semantics directly. |
-| `RequestClientCertificateAsync` | Preserves Kestrel delayed client-certificate semantics when the provider supports post-handshake authentication. Unsupported providers fail explicitly. |
-| `ShutdownWriteAsync` | Separates graceful close, TLS `close_notify`, and TCP FIN from abortive disposal. |
-| `Abort` | Gives servers and clients an immediate failure path that does not wait for graceful drain. |
-| Connection `DisposeAsync` | Waits for backend terminal completions before memory, operation IDs, slots, TLS state, or handles are reclaimed. |
-| `TransportReadResult.Buffer` | Carries one or more completion-selected buffers as a `ReadOnlySequence<byte>`. |
-| `IsCompleted` | Preserves the important "final bytes plus EOF" state. |
-| `TransportReadResult` constructor | Lets an out-of-assembly provider create the value without exposing its native completion or buffer identifiers. |
-| `TransportClientAuthenticationOptions`/`TransportServerAuthenticationOptions` constructors | Support required `AuthenticationOptions` properties and future optional settings without constructor-overload growth. |
-| `Transport*AuthenticationOptions.AuthenticationOptions` | Reuses the existing runtime TLS semantic model rather than creating a parallel certificate/protocol/cipher API. |
-| `Transport*AuthenticationOptions.Offload` | Keeps optional record-layer offload policy adjacent to, but distinct from, TLS negotiation policy. |
-| `ClientHelloCallback` | Preserves raw first-record observation needed by current Kestrel users, including JA4-style consumers. |
-| `OptionsSelectionCallback` | Supplies an async, provider-neutral per-connection option hook after ClientHello parsing. |
-| `AllowPostHandshakeClientAuthentication` | Makes delayed client certificate behavior explicit and allows unsupported providers to reject before application traffic. |
-| `TransportClientHelloCallback`/`TransportServerOptionsSelectionCallback` | Named delegates document timing and permit allocation-conscious implementations without introducing ASP.NET Core types. |
-| `TransportServerHandshakeContext` constructor | Allows an external provider implementation to construct the callback context; the type contains only provider-neutral borrowed data. |
-| `TransportServerHandshakeContext.Connection` | Gives library adapters stable connection identity and endpoint metadata without depending on ASP.NET Core `ConnectionContext`. |
-| `ClientHelloInfo` | Reuses the runtime's parsed SNI/protocol-version view. |
-| `FirstRecordBytes` | Preserves exact current Kestrel raw-record semantics; it is intentionally not named as a complete ClientHello. |
-| `ContainsCompleteClientHello` | Prevents consumers from mistaking a first-record callback for a guaranteed complete handshake message. |
-| `TransportTlsOffloadOptions.Transmit`/`Receive` | kTLS TX and RX are independently installed and may have different availability. |
-| `TlsOffloadPolicy.Disabled`/`Prefer`/`Require` | Distinguishes no request, allowed fallback, and a hard activation requirement. |
-| `TransportTlsInfo.Protocol`/`NegotiatedCipherSuite`/`ApplicationProtocol`/`ServerName` | Publishes the negotiated facts required by Kestrel and client protocol dispatch. |
-| `TransportTlsInfo.RemoteCertificate` | Publishes the authenticated peer certificate with connection-scoped lifetime. |
-| `TransportTlsInfo.TryGetChannelBindingBytes` | Preserves Kestrel's existing channel-binding feature without exposing TLS-library handles. |
-| `TransportTlsInfo.Offload` | Publishes actual post-handshake offload state separately from requested policy and negotiated TLS. |
-| `TransportTlsOffloadInfo.Transmit`/`Receive` | Keeps direction-specific outcomes together as one immutable handshake result. |
-| `TransportTlsOffloadDirectionInfo` constructor | Lets an external provider report its typed result without exposing backend internals. |
-| `RequestedPolicy` | Records which caller contract produced the result. |
-| `KernelRecordLayerActive` | Reports actual activation after negotiation rather than restating configuration. |
-| `HardwareOffload` | Separates kernel TLS from NIC crypto and allows an honest unknown state. |
-| `FallbackReason` | Makes a `Prefer` fallback diagnosable without requiring backend-specific exception parsing. |
-| `TlsHardwareOffloadStatus` values | Distinguish absence, proven inactivity, proven activity, and unavailable per-connection evidence. |
-| `TlsOffloadFallbackReason` values | Classify the stable reason categories that determine whether `Prefer` fell back or `Require` failed. The API review recommends keeping the detailed enum diagnostic-only initially. |
-| `TransportPipeOptions.InputOptions`/`OutputOptions` | Reuses `PipeOptions` for memory pool, four scheduler roles, and directional backpressure instead of inventing parallel knobs. |
-| `TransportPipeOptions` constructor | Keeps adapter creation compatible with object-initializer configuration. |
-| `LeaveOpen` | Allows adapters to participate in a larger owner without double-disposal. |
-| `TransportDuplexPipe.Input`/`Output` | Supplies the standard `IDuplexPipe` orientation expected by Kestrel and protocol libraries. |
-| `TransportDuplexPipe.Completion` | Reports adapter completion independently of the underlying connection terminal task. |
-| `TransportDuplexPipe.DisposeAsync` | Coordinates both pumps, cancellation, pipe completion, and optional connection disposal. |
-| `TransportPipelines.Create` | Centralizes the reusable bridge so Kestrel and clients do not independently reimplement ownership and shutdown. |
-| `SocketTransportProvider.CreateConnection`/`CreateListener` | Provides explicit migration for existing managed sockets with unambiguous ownership. |
-| `SocketTransportProvider` overrides | Supply the portable reference implementation against which native providers are tested. |
-| `EpollTransportProvider`/`IoUringTransportProvider`/`IocpTransportProvider` | Demonstrate that provider choice is dependency injection, not a switch on `TransportConnection`; their names and constructors remain experimental. |
-
-## Behavioral contract
-
-### Provider lifetime
-
-A provider is intended to be long-lived and shared. Creating one provider per connection is legal but defeats shared engine, pool, and registration reuse. Disposing a provider:
-
-1. stops accepting new work;
-2. causes pending `AcceptAsync` and `ConnectAsync` calls to fail;
-3. initiates abort of connections it still owns;
-4. waits for native terminal completions and callback work that can touch provider resources;
-5. releases rings, completion ports, poll handles, registered memory, TLS contexts, and worker threads.
-
-A listener owns its bound handle but not connections already returned by `AcceptAsync`.
-
-Canceling one `AcceptAsync` wait does not close the listener. Disposing the listener stops new accepts and completes pending accepts with cancellation or disposal consistently across providers. Canceling `ConnectAsync` prevents a connection from being returned; the provider closes the in-progress socket and retains its native operation state until terminal completion.
-
-### Existing Socket adoption
-
-`SocketTransportProvider.CreateConnection` requires a connected TCP `Socket`. `CreateListener` requires a bound, listening TCP `Socket`. In both cases:
-
-- the caller must have no active I/O and must not start independent I/O after adoption;
-- `ownsSocket: true` transfers disposal ownership to the returned transport object;
-- `ownsSocket: false` leaves final `Socket` disposal to the caller, but the caller still grants exclusive I/O use until the returned transport object is disposed;
-- adoption does not duplicate the handle;
-- provider disposal cannot close a non-owned socket, but it cancels and drains the operations it started before returning control.
-
-These APIs are migration seams for existing Socket-based hosts, socket activation adapters, and tests. They are not a native-provider handle-transfer mechanism.
-
-### Read lifetime
-
-For each connection:
-
-1. At most one `ReadAsync` is active.
-2. A successful result establishes one active read lease.
-3. `Buffer` remains valid until `AdvanceRead`.
-4. `AdvanceRead` must be called exactly once before the next `ReadAsync`.
-5. `consumed` releases complete segments before that position.
-6. `examined` tells the provider whether the consumer needs more bytes to make progress.
-7. A result may contain data with `IsCompleted == true`; the consumer must process and advance the final data.
-8. An empty result with `IsCompleted == false` is not returned.
-9. Both positions must belong to the active `Buffer`, and `consumed` must not be after `examined`.
-10. Bytes at or after `consumed` remain part of the next read result until consumed. If `examined` is before the current end, the next read may complete immediately with the same unconsumed data; if it is at the end, the provider waits for additional data or terminal completion.
-
-A canceled or faulted `ReadAsync` establishes no consumer lease and requires no `AdvanceRead`; the provider remains responsible for any native buffer already selected by a racing completion. Providers may pool the objects backing a successful result, but they must detect double advancement and stale use in debug/test builds. Native buffer identity remains internal.
-
-### Write lifetime and ordering
-
-- At most one `WriteAsync` is active.
-- A read and a write may be active concurrently.
-- The provider preserves byte order across calls.
-- A write either accepts the entire sequence and completes when its memory is no longer retained, or throws.
-- Partial `send`, `writev`, `WSASend`, SQE, or TLS-record progress is internal.
-- Cancellation never makes source memory reusable before the provider has observed terminal native completion. The returned task does not complete as canceled until this guarantee holds, unless the provider copied the remaining bytes into memory it owns.
-- If cancellation wins before any bytes are accepted, the connection may remain usable. If a prefix may already have been transmitted and the full write cannot complete, the provider aborts the connection before completing the operation with cancellation or error; it never leaves the caller with an apparently reusable stream after an unknown partial protocol write.
-
-A transport receive EOF closes only the read half when the underlying protocol permits half-close. `Completion` does not complete until the connection is fully terminal, aborted, or disposed. A successful `ShutdownWriteAsync` prevents later writes but does not cancel an active or future read.
-
-`Completion` completes successfully after both directions have ended orderly, or after an intentional local disposal with no supplied failure, and all native operations are terminal. It faults with the first terminal connection/provider error on failure or explicit abort; `Abort(null)` uses `OperationCanceledException` as the terminal error. Disposing an otherwise healthy connection initiates immediate local teardown unless graceful shutdown has already made both halves terminal, and `DisposeAsync` does not return before `Completion` is complete.
-
-### Authentication transition
-
-Authentication is valid only before application reads or writes start. Calling it while a read/write is active, after authentication, or after shutdown throws `InvalidOperationException`.
-
-The implementation snapshots options for that connection. It does not retain a mutable options instance as shared live state.
-
-`ObserveTlsClientHelloAsync` is valid only on an accepted server connection before authentication or application I/O. It reads and parses the first TLS record without losing those bytes from the later handshake, invokes the supplied callback only when that record is a TLS ClientHello, and then completes. Non-TLS input or EOF before a complete first record skips the observer and remains for authentication to reject. The callback's sequence is valid only until its returned `ValueTask` completes. `ContainsCompleteClientHello` is computed from the handshake-message length and reports whether that first record contains the whole message. The method may be called more than once before authentication; later calls observe the cached first record and do not reread the network. Cancellation or a callback exception fails the connection because the pre-authentication stream state is no longer safe to hand to unrelated plaintext logic.
-
-When authentication succeeds:
-
-- subsequent reads and writes are plaintext;
-- `TlsInfo` is non-null and immutable;
-- `Completion` covers both TLS and transport failures;
-- the provider owns the TLS session and any certificate instance it exposes.
-
-When authentication fails:
-
-- the connection is aborted;
-- no plaintext fallback occurs;
-- the authentication operation throws the callback, authentication, cancellation, or unsupported-feature exception;
-- `Completion` reaches the same terminal state.
-
-### Callback execution
-
-- `ClientHelloCallback` runs before `OptionsSelectionCallback`.
-- Callbacks are serialized for one connection and may run concurrently for different connections.
-- They are not invoked on a backend poll/completion loop.
-- No provider-global lock or TLS-session lock is held while user code runs.
-- The cancellation token represents handshake cancellation and timeout.
-- `FirstRecordBytes` is borrowed and valid only until the callback operation completes; callers copy data they retain.
-- Reentrant I/O, authentication, shutdown, or disposal on the same connection is unsupported and throws.
-- A callback exception fails only that connection.
-
-### TLS option validation
-
-The returned `SslServerAuthenticationOptions` and supplied `SslClientAuthenticationOptions` are the semantic contract. A native provider validates every property. It cannot ignore a property because the underlying TLS library has no direct equivalent.
-
-Platform behavior already present in `SslStream` remains platform behavior. For example, `CipherSuitesPolicy` is not supported by the current Windows PAL. A native Windows provider may reject it in the same way; "parity" does not mean inventing cross-platform support absent from `SslStream`.
-
-### Offload
-
-`Disabled` requires userspace record protection. `Prefer` requests kernel record protection but permits fallback. `Require` fails authentication unless that direction is active.
-
-The result is recorded separately for transmit and receive. The negotiated protocol and cipher are always reported separately because a supported-looking cipher is not proof that kTLS installed it.
-
-`HardwareOffload` reports:
-
-- `NotApplicable` when the kernel record layer is not active;
-- `Inactive` only when the provider has reliable evidence that host software handles crypto;
-- `Active` only with reliable per-connection evidence;
-- `Unknown` when kTLS is active but per-connection hardware attribution is unavailable.
-
-No public method changes NIC or kernel configuration.
-
-Result invariants:
-
-- `Disabled` produces `KernelRecordLayerActive == false`, `HardwareOffload == NotApplicable`, and `FallbackReason == None`.
-- An active direction produces `KernelRecordLayerActive == true` and `FallbackReason == None`.
-- A preferred but inactive direction produces a non-`None` fallback reason.
-- A required but inactive direction never appears in a successful `TransportTlsInfo`; authentication fails instead.
-- `HardwareOffload` is `NotApplicable` unless the kernel record layer is active.
-
-### Task and ValueTask choices
-
-`AcceptAsync`, `ReadAsync`, `WriteAsync`, and `ShutdownWriteAsync` are repeated operations with legitimate synchronous-completion paths, so the experimental surface uses `ValueTask`. `ConnectAsync`, `ListenAsync`, and authentication also mirror existing runtime/Kestrel `ValueTask`-returning provider patterns and allow native setup to complete without allocating a `Task`; this choice must be revisited with usage data before stabilization. `Completion` is a reusable `Task`, and `RequestClientCertificateAsync` returns `Task` to mirror the existing `SslStream` and Kestrel contract. The callback delegates use `ValueTask` because the common certificate/raw-observation decisions are synchronous and Kestrel's existing server-options callback already has that shape.
-
-## Illustrative server examples
-
-### Plain TCP
+Consumer protocol code does not change. Provider creation and provider options change.
 
 ```csharp
-using System.Buffers;
-using System.Net;
-using System.Net.Transport;
-using System.Net.Transport.Sockets;
-
-await using TransportProvider provider = new SocketTransportProvider();
-await using TransportListener listener = await provider.ListenAsync(
-    new TransportListenOptions
+TransportProvider provider = TransportProviders.IoUring(
+    new IoUringTransportOptions
     {
-        EndPoint = new IPEndPoint(IPAddress.Any, 5000),
-        Backlog = 512,
-        NoDelay = true,
-    },
-    shutdownToken);
-
-while (!shutdownToken.IsCancellationRequested)
-{
-    TransportConnection connection = await listener.AcceptAsync(shutdownToken);
-    await EchoAsync(connection, shutdownToken); // Simplified serial sample; a real server supervises concurrent handlers.
-}
-
-static async Task EchoAsync(
-    TransportConnection connection,
-    CancellationToken cancellationToken)
-{
-    await using (connection)
-    {
-        while (true)
-        {
-            TransportReadResult result = await connection.ReadAsync(cancellationToken);
-            ReadOnlySequence<byte> buffer = result.Buffer;
-
-            try
-            {
-                if (!buffer.IsEmpty)
-                {
-                    await connection.WriteAsync(buffer, cancellationToken);
-                }
-            }
-            finally
-            {
-                connection.AdvanceRead(buffer.End, buffer.End);
-            }
-
-            if (result.IsCompleted)
-            {
-                await connection.ShutdownWriteAsync(cancellationToken);
-                break;
-            }
-        }
-    }
-}
-```
-
-### TLS server with raw ClientHello observation and per-SNI certificate selection
-
-```csharp
-using System.Buffers;
-using System.Net.Security;
-using System.Net.Transport;
-using System.Security.Authentication;
-
-var defaultOptions = new SslServerAuthenticationOptions
-{
-    ServerCertificateContext = defaultCertificateContext,
-    EnabledSslProtocols = SslProtocols.None,
-    ApplicationProtocols =
-    [
-        SslApplicationProtocol.Http2,
-        SslApplicationProtocol.Http11,
-    ],
-};
-
-TransportClientHelloCallback observeClientHello =
-    static (context, cancellationToken) =>
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-
-        // The sequence is borrowed. Parse synchronously or copy what must survive.
-        ObserveJa4Input(
-            context.FirstRecordBytes,
-            context.ContainsCompleteClientHello);
-
-        return ValueTask.CompletedTask;
-    };
-
-var tlsOptions = new TransportServerAuthenticationOptions
-{
-    AuthenticationOptions = defaultOptions,
-    OptionsSelectionCallback = (context, options, cancellationToken) =>
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-
-        options.ServerCertificateContext =
-            certificates.GetRequired(context.ClientHelloInfo.ServerName);
-
-        return ValueTask.FromResult(options);
-    },
-    Offload = new TransportTlsOffloadOptions
-    {
-        Transmit = TlsOffloadPolicy.Prefer,
-        Receive = TlsOffloadPolicy.Prefer,
-    },
-};
-
-TransportConnection connection = await listener.AcceptAsync(shutdownToken);
-
-// Kestrel's UseTlsClientHelloListener-style phase can have its own timeout.
-await connection.ObserveTlsClientHelloAsync(
-    observeClientHello,
-    clientHelloTimeoutToken);
-
-TransportTlsInfo tls = await connection.AuthenticateAsServerAsync(
-    tlsOptions,
-    handshakeTimeoutToken);
-
-Console.WriteLine(
-    $"TLS={tls.Protocol}, cipher={tls.NegotiatedCipherSuite}, " +
-    $"kTLS TX={tls.Offload.Transmit.KernelRecordLayerActive}, " +
-    $"kTLS RX={tls.Offload.Receive.KernelRecordLayerActive}");
-```
-
-This example does not claim that `Prefer` activates kTLS. It reports the actual result.
-
-## Illustrative client examples
-
-### Authenticated client
-
-```csharp
-using System.Net;
-using System.Net.Security;
-using System.Net.Transport;
-
-TransportConnection connection = await provider.ConnectAsync(
-    new TransportConnectOptions
-    {
-        RemoteEndPoint = new DnsEndPoint("cache.example.net", 6380),
-        NoDelay = true,
-    },
-    cancellationToken);
-
-await connection.AuthenticateAsClientAsync(
-    new TransportClientAuthenticationOptions
-    {
-        AuthenticationOptions = new SslClientAuthenticationOptions
-        {
-            TargetHost = "cache.example.net",
-            ApplicationProtocols = [new SslApplicationProtocol("resp3")],
-            CertificateRevocationCheckMode = X509RevocationMode.Online,
-        },
-        Offload = new TransportTlsOffloadOptions
-        {
-            Transmit = TlsOffloadPolicy.Prefer,
-            Receive = TlsOffloadPolicy.Prefer,
-        },
-    },
-    cancellationToken);
-```
-
-The connection owns the TLS state. The caller owns the connection and must dispose it.
-
-### Redis-style long-lived multiplexer
-
-```csharp
-using System.Net.Transport.Pipelines;
-
-public sealed class RespConnectionFactory
-{
-    private readonly TransportProvider _provider;
-    private readonly EndPoint _endpoint;
-    private readonly string _targetHost;
-
-    public RespConnectionFactory(
-        TransportProvider provider,
-        EndPoint endpoint,
-        string targetHost)
-    {
-        _provider = provider;
-        _endpoint = endpoint;
-        _targetHost = targetHost;
-    }
-
-    public async ValueTask<TransportDuplexPipe> ConnectAsync(
-        CancellationToken cancellationToken)
-    {
-        TransportConnection connection = await _provider.ConnectAsync(
-            new TransportConnectOptions
-            {
-                RemoteEndPoint = _endpoint,
-                NoDelay = true,
-            },
-            cancellationToken);
-
-        try
-        {
-            await connection.AuthenticateAsClientAsync(
-                new TransportClientAuthenticationOptions
-                {
-                    AuthenticationOptions = new SslClientAuthenticationOptions
-                    {
-                        TargetHost = _targetHost,
-                    },
-                },
-                cancellationToken);
-
-            return TransportPipelines.Create(
-                connection,
-                new TransportPipeOptions
-                {
-                    LeaveOpen = false,
-                });
-        }
-        catch
-        {
-            await connection.DisposeAsync();
-            throw;
-        }
-    }
-}
-```
-
-The multiplexer owns:
-
-- request IDs and response correlation;
-- a single writer queue for protocol ordering;
-- reconnect delays and retry policy;
-- logical request timeout and replay safety;
-- physical connection pooling, if any.
-
-The transport owns:
-
-- connect cancellation;
-- one physical stream;
-- TLS authentication and certificate validation;
-- receive/write memory lifetime;
-- close and terminal error reporting.
-
-The provider is shared across reconnects. Replacing it for every physical connection would discard the shared engine and pool model.
-
-For a real multiplexer, the returned pipe is handed to one protocol read loop and one serialized protocol write loop. The reconnection owner observes `TransportDuplexPipe.Completion`, disposes the failed pipe, creates a replacement through this factory, and decides which pending commands are safe to retry.
-
-The transport does not retry a canceled or failed connect and does not replay writes. Those decisions require protocol knowledge: a Redis command may or may not be idempotent, and bytes accepted by a local send completion are not proof that the peer processed the command.
-
-## Illustrative Pipelines adapter
-
-```csharp
-using System.IO.Pipelines;
-using System.Net.Transport;
-using System.Net.Transport.Pipelines;
-
-var inputOptions = new PipeOptions(
-    pool: memoryPool,
-    readerScheduler: applicationScheduler,
-    writerScheduler: transportScheduler,
-    pauseWriterThreshold: maxReadBufferSize,
-    resumeWriterThreshold: maxReadBufferSize / 2,
-    useSynchronizationContext: false);
-
-var outputOptions = new PipeOptions(
-    pool: memoryPool,
-    readerScheduler: transportScheduler,
-    writerScheduler: applicationScheduler,
-    pauseWriterThreshold: maxWriteBufferSize,
-    resumeWriterThreshold: maxWriteBufferSize / 2,
-    useSynchronizationContext: false);
-
-await using TransportDuplexPipe transport = TransportPipelines.Create(
-    connection,
-    new TransportPipeOptions
-    {
-        InputOptions = inputOptions,
-        OutputOptions = outputOptions,
-        LeaveOpen = false,
+        RingEntryCount = 4096,
+        ProvidedBufferCount = 512,
+        ReceiveBufferSize = 4096,
+        WriteBufferSize = 16384,
+        TlsStrategy = IoUringTlsStrategy.MemoryBio,
     });
 
-connectionContext.Transport = transport;
+using TransportEngine engine = provider.CreateEngine(
+    new TransportEngineOptions
+    {
+        InitialWorkerCount = Environment.ProcessorCount,
+        MaximumConnectionsPerWorker = 4096,
+        PinWorkerThreads = true,
+    },
+    application);
+
+using TransportListener listener = engine.Listen(
+    new TransportListenOptions
+    {
+        EndPoint = new IPEndPoint(IPAddress.Any, 8443),
+        Tls = serverTls,
+    });
 ```
 
-### Adapter receive loop
+Changing `IoUring` to `Epoll`, `WindowsIocp`, `WindowsRio`, or `ManagedSockets` changes provider construction and valid provider options, not connection callback code.
 
-Illustrative algorithm:
+## Provider-specific usage examples
 
-```csharp
-while (true)
-{
-    TransportReadResult read = await connection.ReadAsync(stopToken);
+Compilable illustrative usage files are under [`examples`](examples/README.md):
 
-    try
-    {
-        foreach (ReadOnlyMemory<byte> segment in read.Buffer)
-        {
-            inbound.Writer.Write(segment.Span);
-        }
+- [`ManagedSocketsPlaintext.cs`](examples/ManagedSocketsPlaintext.cs)
+- [`ManagedSocketsTls.cs`](examples/ManagedSocketsTls.cs)
+- [`EpollPlaintext.cs`](examples/EpollPlaintext.cs)
+- [`EpollSocketBoundTls.cs`](examples/EpollSocketBoundTls.cs)
+- [`IoUringPlaintext.cs`](examples/IoUringPlaintext.cs)
+- [`IoUringMemoryBioTls.cs`](examples/IoUringMemoryBioTls.cs)
+- [`IoUringSocketBoundTls.cs`](examples/IoUringSocketBoundTls.cs)
+- [`WindowsIocpTls.cs`](examples/WindowsIocpTls.cs)
+- [`WindowsRioTls.cs`](examples/WindowsRioTls.cs)
 
-        FlushResult flush = await inbound.Writer.FlushAsync(stopToken);
-        if (flush.IsCanceled || flush.IsCompleted)
-        {
-            break;
-        }
-    }
-    finally
-    {
-        connection.AdvanceRead(read.Buffer.End, read.Buffer.End);
-    }
+Each file shows:
 
-    if (read.IsCompleted)
-    {
-        break;
-    }
-}
-```
+- provider selection;
+- provider-specific options;
+- engine and listener lifetime;
+- the same callback-based read/write application;
+- TLS configuration and when the handshake completes;
+- important limitations of that provider/strategy.
 
-The universal adapter copies inbound bytes into the pipe. A provider-specific optimized adapter may expose backend memory directly through a custom `PipeReader`, but only if `AdvanceTo` returns every underlying lease correctly. That optimization is not part of the first common SPI.
+## Higher-level async adapters
 
-### Adapter send loop
+The core does not reject async programming. It moves async to adapters that have a reason to allocate and correlate tasks.
 
-Illustrative algorithm:
+Examples:
 
-```csharp
-while (true)
-{
-    ReadResult read = await outbound.Reader.ReadAsync(stopToken);
-    ReadOnlySequence<byte> buffer = read.Buffer;
+- a client adapter stores a `TaskCompletionSource` keyed by `TransportConnectOperation.Id` and completes it from `OnReady` or `OnConnectFailed`;
+- a write adapter stores a waiter keyed by `TransportWriteOperation.Id` and completes it from `OnWriteCompleted`;
+- a Pipelines adapter copies or adopts `OnReceive` data and pauses receiving when `FlushAsync` applies backpressure;
+- a Stream adapter serializes one read waiter and one write waiter;
+- Kestrel implements `IConnectionListener.AcceptAsync` over the listener callbacks.
 
-    try
-    {
-        if (!buffer.IsEmpty)
-        {
-            await connection.WriteAsync(buffer, stopToken);
-        }
-    }
-    finally
-    {
-        outbound.Reader.AdvanceTo(buffer.End);
-    }
+These adapters can offer cancellation tokens because they own the waiter and can call the core operation's cancellation or abort mechanism. The core provider still retains native state until terminal completion.
 
-    if (read.IsCompleted)
-    {
-        await connection.ShutdownWriteAsync(stopToken);
-        break;
-    }
-}
-```
+The adapter API should be designed after the callback core has a working managed implementation. It is intentionally not included in the reference surface above.
 
-The adapter advances the output pipe only after `WriteAsync` releases the sequence. This is the key ownership invariant for scatter/gather, pinned segments, IOCP `WSABUF`s, and io_uring iovecs.
+## How this fixes the SocketSet issues
 
-### Adapter concurrency and lifecycle
-
-| Event | Adapter behavior |
+| SocketSet issue | Revised design |
 |---|---|
-| Remote orderly EOF | Complete the inbound `PipeWriter` normally after publishing final bytes; allow pending outbound data to drain unless the protocol/TLS state makes further writes invalid |
-| Transport read error | Complete inbound with the exception, cancel the outbound pump, abort the connection, and fault adapter `Completion` |
-| Application completes `Input` early | Stop the receive pump; abort if unread network data cannot be safely ignored |
-| Application completes `Output` normally | Drain all buffered output, call `ShutdownWriteAsync`, and permit the receive half to continue |
-| Application completes `Output` with error | Abort the connection and complete inbound with that error |
-| Transport write error | Complete the outbound reader with the exception, abort the connection, and fault inbound |
-| `PipeReader.CancelPendingRead` | Cancel only the current application wait; do not silently close the transport |
-| `PipeWriter.CancelPendingFlush` | Cancel only the current application flush wait; the send pump retains already accepted bytes until their ownership contract completes |
-| `TransportConnection.Abort` | Cancel both pumps, complete both pipe directions with the terminal error, and await native drain during adapter disposal |
-| `TransportDuplexPipe.DisposeAsync` | Stop both pumps, abort if graceful output completion has not already occurred, await pump termination, and dispose the connection unless `LeaveOpen` is true |
+| Portable and backend options share one bag | `TransportEngineOptions` contains only shared policy; each built-in provider has a typed options class |
+| Whole engine owns all listeners with no listener object | `TransportEngine.Listen` returns an independently disposable `TransportListener` |
+| `void Connect` has weak failure correlation | `TransportConnectOperation` identifies and cancels one attempt; completion callbacks carry it |
+| `OnClosed(Connection)` loses the error | `TransportClosedContext` carries phase, reason, and exception |
+| Public factory/shard/connection SPI exposes many mechanics | Built-in provider classes and native operation types stay internal; the public SPI is provider -> engine -> connection plus callback contexts |
+| TLS provider SPI diverges from built-in fd-bound path | Built-in TLS integration remains inside the owning runtime assembly; no claim is made that the initial public transport SPI exposes every TLS implementation hook |
+| Server TLS selection callback cannot see ClientHello | Raw and async option callbacks are raised from the handshake after ClientHello parsing |
+| Unwiped buffer escape hatches are public | The proposed callback buffer API has no unwiped variant |
+| Construction hides threads/native setup inside a subclass constructor | Provider creation is cheap; `CreateEngine` is the explicit synchronous resource-creation boundary |
+| Cached global `Default` fixes one probe result for process lifetime | `TransportProviders.CreateDefault()` probes per call and the created engine reports the selected provider |
+| Adapter-specific options partially duplicate engine options | Adapter options own only bridge/scheduler behavior; provider and engine options remain provider/engine objects |
 
-The adapter never performs two concurrent reads or two concurrent writes. It may run one receive pump and one send pump concurrently. A completion callback from one direction must not run arbitrary application work on the backend's I/O loop; `InputOptions` and `OutputOptions` determine where those continuations execute.
+## Open questions
 
-## Kestrel adapter rules
-
-The Kestrel adapter should:
-
-1. create one provider per server or configured provider scope, not per connection;
-2. create one listener per endpoint;
-3. run TLS authentication before passing a secured connection to HTTP processing;
-4. use the current Kestrel memory pool and direction-specific schedulers through `TransportPipeOptions`;
-5. set generic TLS features from `TransportTlsInfo`;
-6. expose `ISslStreamFeature` only for the real `SslStream` fallback;
-7. never fabricate `IConnectionSocketFeature` for a raw provider;
-8. treat explicit provider incompatibility as bind failure;
-9. allow an automatic mode to choose the managed fallback, with an observable provider-selection event;
-10. keep connection limits, middleware, logging, and HTTP protocol selection in ASP.NET Core.
-
-## Backend SPI invariants
-
-Every provider implementation must satisfy these invariants even though the native mechanisms differ:
-
-- A connection has a monotonic generation or equivalent identity. Native completions are validated against it before touching managed state.
-- A receive segment has a provider-private buffer identity. It is returned only after `AdvanceRead`.
-- A canceled operation remains represented until its terminal native completion is observed.
-- A connection slot, OVERLAPPED block, SQE identity, registered buffer, pin, or fd is never reused while a stale completion can still reference it.
-- Read and write errors are terminal unless a documented retry status is handled internally.
-- Partial sends preserve ordering and source lifetime.
-- Callbacks run outside shared I/O loops and locks.
-- Provider shutdown waits for callbacks and asynchronous disposals that can reach provider resources.
-- A TLS implementation serializes access to a single TLS session even while allowing one application read and one application write to be pending.
-- No unsupported TLS option is silently ignored.
-
-## Why the API does not expose backend operations
-
-The public API does not expose `WaitForReadabilityAsync`, `Submit`, `Poll`, buffer IDs, CQE flags, OVERLAPPED pointers, or event masks. Those are implementation mechanics, not portable semantics:
-
-- fd-bound OpenSSL needs readiness because `SSL_read` can want write and `SSL_write` can want read;
-- memory-BIO TLS needs ciphertext input/output, not socket readiness;
-- io_uring plaintext receive may be multishot;
-- IOCP identifies completion through an OVERLAPPED address;
-- managed `Socket` may complete synchronously or asynchronously.
-
-The portable contract is the outcome and lifetime: data, advancement, write completion, cancellation, authentication, shutdown, and terminal completion.
-
-## Rejected surface ideas
-
-### `Socket2`, `AsyncSocket`, or `NativeSocket`
-
-Rejected because the semantics are not a new kind of operating-system socket. Such names imply datagrams, socket options, raw handles, and compatibility that the abstraction intentionally does not provide.
-
-### A generic `Capabilities` flags bag
-
-Rejected because capabilities such as kTLS depend on role, direction, build, kernel, negotiated protocol/cipher, and configured callbacks. A static bit cannot answer whether offload is active for one connection. Typed configuration plus post-handshake outcome is more accurate.
-
-### `Stream` as the only low-level contract
-
-Rejected because caller-supplied read buffers erase completion-selected buffer identity, and `Stream` has no listener/provider lifetime, endpoint metadata, offload state, or terminal completion contract. A `Stream` adapter remains useful for compatibility and `SslStream`.
-
-### `IDuplexPipe` as the only low-level contract
-
-Rejected for the core because a pipe does not define listener/connect/TLS lifecycle or native terminal completion ownership, and a standard `PipeWriter` cannot adopt arbitrary provider-owned receive buffers. Pipelines remain the primary higher-level adapter.
-
-### Raw handle exposure
-
-Rejected from the common surface because two independent I/O owners on one TCP stream can corrupt ordering and TLS framing. Provider-specific adoption APIs require explicit ownership and should not imply that the handle remains independently usable.
+1. Should provider creation use static factory methods as shown, or public concrete provider classes?
+2. Is synchronous blocking `TransportEngine.Dispose` acceptable, or should the core expose `Stop` plus a callback when workers are drained?
+3. Should `TransportWriteOperation` support cancellation, given that cancellation after a partial stream write generally requires aborting the connection?
+4. Is `RequiredWorkerIndex` too implementation-specific, or is it justified by proxy affinity?
+5. Should immediate response buffers be retained in the BCL surface, or should `OnReceive` only expose payload and require `Connection.Send`?
+6. Which provider options have a real user scenario versus being benchmark-only implementation knobs?
+7. Does the first public SPI support third-party providers, or only built-in provider selection while the SPI incubates internally?
+8. What minimal public low-level TLS-session contract is needed if `System.Net.Transport` later moves out of `System.Net.Security.dll`?
 
 ## API evolution rule
 
-The experimental package should track unsupported or unused members aggressively. Before stabilization:
+The managed provider should be implemented first because it can prove callback semantics, listener/connect correlation, close reasons, TLS policy integration, and adapters without requiring a new native backend. epoll and IOCP then prove one readiness and one completion provider. io_uring and RIO should follow only after the provider-specific options and buffer lifetimes are tested.
 
-- remove members with no demonstrated consumer;
-- move backend tuning to provider-specific packages;
-- retain only option-independent, testable semantics;
-- avoid compatibility promises for native provider names;
-- compare the final shape against the existing `Socket`, `SslStream`, `Stream`, and Pipelines surfaces again.
+No stable public surface should be proposed until:
+
+- the managed provider runs a real Kestrel adapter and a long-lived multiplexed client;
+- epoll and IOCP implement the same callbacks;
+- the async/Pipelines adapters need no provider-specific public escape hatch;
+- ClientHello and all required Kestrel TLS callbacks work without a separate handshake method;
+- provider options report what was actually applied;
+- measurements identify which low-level mechanisms justify public exposure rather than internal Socket improvements.
