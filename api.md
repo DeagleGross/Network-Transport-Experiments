@@ -98,6 +98,93 @@ The core API ends at callbacks and borrowed buffers. `Task`, `Stream`, and `IDup
 
 ## Proposed reference surface
 
+### Usage chain and callback ownership
+
+The caller creates three independent objects and joins them at `TransportProvider.CreateEngine`:
+
+```csharp
+TransportProvider provider =
+    TransportProviders.CreateDefault();
+
+var application =
+    new EchoApplication();
+
+var engineOptions =
+    new TransportEngineOptions
+    {
+        InitialWorkerCount = Environment.ProcessorCount,
+    };
+
+using TransportEngine engine =
+    provider.CreateEngine(
+        engineOptions,
+        application);
+```
+
+Their roles are different:
+
+| Object | Created by | Responsibility |
+|---|---|---|
+| `TransportProvider` | Caller through `TransportProviders` | Selects one implementation and carries provider-specific configuration. It is a cheap factory and does not own active connections. |
+| `ITransportApplication` | Caller, normally by deriving from `TransportApplication` | Receives every lifecycle and data callback from the engine created with it. It contains adapter or protocol integration logic, not native provider resources. |
+| `TransportEngineOptions` | Caller | Configures provider-independent worker and capacity policy for one engine. |
+| `TransportEngine` | Provider when `CreateEngine` is called | Owns workers, rings, pollers, completion ports, buffer pools, listeners, connections, and the registered application callback target. |
+
+`CreateEngine(options, application)` is the attachment point between the engine and application. The engine retains the application reference for its entire lifetime. Every listener and outbound connection created by that engine reports through that same application:
+
+```text
+TransportProviders
+    -> creates TransportProvider
+
+caller creates ITransportApplication
+caller creates TransportEngineOptions
+
+TransportProvider.CreateEngine(options, application)
+    -> creates TransportEngine
+    -> engine retains application
+    -> engine starts provider resources
+
+TransportEngine.Listen(...)
+    -> OnAccepting
+    -> optional TLS handshake
+    -> OnReady
+    -> OnReceive*
+    -> OnWriteCompleted*
+    -> OnClosed
+
+TransportEngine.Connect(...)
+    -> OnReady
+       or OnConnectFailed
+```
+
+The application is not a connection and does not mean that application business logic runs inside provider callbacks. It is the engine-wide callback receiver, usually implemented by an adapter:
+
+- `System.Net.Transport.Pipelines` uses one internal application to turn callbacks into `TransportPipeListener`, `TransportPipeConnection`, `PipeReader`, and `PipeWriter` operations;
+- a protocol library can use one application to route callbacks into its own per-connection state;
+- a low-level server can derive directly from `TransportApplication`.
+
+One application instance may therefore receive callbacks for many listeners and connections concurrently. Callback contexts identify the relevant listener, connection, connect operation, or write operation. Per-connection adapter state is normally stored in `TransportConnection.State`:
+
+```csharp
+protected override void OnReady(
+    ref TransportReadyContext context)
+{
+    context.Connection.State =
+        new ProtocolConnection(context.Connection);
+}
+
+protected override void OnReceive(
+    ref TransportReceiveContext context)
+{
+    var connection =
+        (ProtocolConnection)context.Connection.State!;
+
+    connection.OnReceive(ref context);
+}
+```
+
+Disposing the engine stops callback production only after provider operations reach their required terminal state. The caller must keep the application alive until engine disposal returns. The application does not dispose the engine from inside a callback.
+
 ### Provider selection
 
 Built-in provider implementation classes remain internal. The public static factory gives callers typed configuration without exposing the implementation class itself.
@@ -144,6 +231,8 @@ public abstract class TransportProvider
 }
 ```
 
+The provider is not the active event loop. It becomes active only when the caller supplies an engine configuration and application callback target to `CreateEngine`.
+
 `CreateDefault` probes every time it is called rather than returning one globally cached provider. Proposed default order:
 
 1. Windows IOCP;
@@ -152,33 +241,6 @@ public abstract class TransportProvider
 4. managed Socket.
 
 RIO is never selected automatically.
-
-### Portable engine options
-
-These options express policy shared by every provider. They deliberately exclude ring entries, epoll event batches, IOCP completion batches, RIO queue depth, and provider buffer-registration mechanics.
-
-```csharp
-[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
-public sealed class TransportEngineOptions
-{
-    public TransportEngineOptions();
-
-    public int InitialWorkerCount { get; set; }
-    public int MaximumWorkerCount { get; set; }
-    public int MaximumConnectionsPerWorker { get; set; } = 4096;
-    public bool PinWorkerThreads { get; set; }
-    public bool TrackEndpoints { get; set; } = true;
-    public TimeSpan IdleTimeout { get; set; }
-}
-```
-
-Semantics:
-
-- `InitialWorkerCount == 0` lets the selected provider choose.
-- `MaximumWorkerCount == 0` disables dynamic growth.
-- a provider may clamp worker count to its model; the managed provider uses one logical worker;
-- `MaximumConnectionsPerWorker` is a capacity policy, not a ring-entry or buffer-count setting;
-- provider-resolved values are readable from the created engine.
 
 ### Typed provider options
 
@@ -268,9 +330,9 @@ namespace System.Net.Transport.Rio
 
 These are candidate experimental resource knobs, not a claim that every value should stabilize. TLS implementation strategy is deliberately absent: configuring TLS has one public meaning, while fd-bound OpenSSL, memory-BIO OpenSSL, `SslStream`, Schannel, and kTLS are provider implementation decisions.
 
-### Application callbacks
+### Application callback target
 
-The application object is separate from the engine so one object does not simultaneously represent provider resources, listener lifetime, callbacks, and user protocol state.
+The application is created by the caller and passed to `TransportProvider.CreateEngine`. The resulting engine retains it as its callback target. It is separate from the engine so one object does not simultaneously represent provider resources, listener lifetime, callbacks, and user protocol state.
 
 ```csharp
 [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
@@ -333,6 +395,14 @@ public abstract class TransportApplication : ITransportApplication
 
 Providers invoke the public `ITransportApplication` contract. Most consumers derive from `TransportApplication`, which explicitly implements that interface and offers protected virtual methods so only the callbacks they need must be overridden.
 
+The callback target is engine-wide:
+
+- `OnAccepting`, `OnReady`, `OnReceive`, `OnWriteCompleted`, and `OnClosed` identify one connection;
+- `OnConnectFailed` identifies one outbound connect operation which never became ready;
+- `OnListenerClosed` identifies one listener;
+- `OnWorkerFaulted` identifies provider-wide worker failure;
+- `OnBatchCompleted` identifies completion of one provider worker batch.
+
 Callback rules:
 
 - callbacks for one connection are serialized on its owning provider context;
@@ -343,9 +413,36 @@ Callback rules:
 - `OnWorkerFaulted` is reserved for a provider-wide worker failure;
 - `OnBatchCompleted` permits protocol adapters to coalesce work at provider-batch granularity.
 
-### Engine and listener lifetime
+### Engine configuration
 
-Control-plane creation is synchronous. It may allocate native resources and start workers, and it fails before returning.
+After selecting a provider and creating the application callback target, the caller configures the engine which will join them. These options express policy shared by every provider. They deliberately exclude ring entries, epoll event batches, IOCP completion batches, RIO queue depth, and provider buffer-registration mechanics.
+
+```csharp
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public sealed class TransportEngineOptions
+{
+    public TransportEngineOptions();
+
+    public int InitialWorkerCount { get; set; }
+    public int MaximumWorkerCount { get; set; }
+    public int MaximumConnectionsPerWorker { get; set; } = 4096;
+    public bool PinWorkerThreads { get; set; }
+    public bool TrackEndpoints { get; set; } = true;
+    public TimeSpan IdleTimeout { get; set; }
+}
+```
+
+Semantics:
+
+- `InitialWorkerCount == 0` lets the selected provider choose.
+- `MaximumWorkerCount == 0` disables dynamic growth.
+- a provider may clamp worker count to its model; the managed provider uses one logical worker;
+- `MaximumConnectionsPerWorker` is a capacity policy, not a ring-entry or buffer-count setting;
+- provider-resolved values are readable from the created engine.
+
+### Engine creation and lifetime
+
+`TransportProvider.CreateEngine(options, application)` synchronously creates the active resource owner. It may allocate native resources and start workers, and it fails before returning.
 
 ```csharp
 [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
@@ -365,7 +462,27 @@ public abstract class TransportEngine : IDisposable
 
     public abstract void Dispose();
 }
+```
 
+An engine has exactly one application callback target in this proposal. The same target receives events for all listeners and outbound connections created by the engine. Consumers which want separate logical applications can create separate engines or use one application adapter which routes by listener, connection, or operation state.
+
+The engine/application relationship is:
+
+```text
+TransportEngine
+    owns provider workers and connections
+    retains one ITransportApplication
+    invokes that application for completions
+
+ITransportApplication
+    does not own native provider resources
+    receives contexts identifying the affected object
+    routes work to per-listener or per-connection state
+```
+
+### Listener creation and lifetime
+
+```csharp
 [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
 public sealed class TransportListenOptions
 {
