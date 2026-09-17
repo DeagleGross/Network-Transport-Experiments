@@ -103,32 +103,21 @@ The core API ends at callbacks and borrowed buffers. `Task`, `Stream`, and `IDup
 The caller creates three independent objects and joins them at `TransportProvider.CreateEngine`:
 
 ```csharp
-TransportProvider provider =
-    TransportProviders.CreateDefault();
+TransportProvider provider = TransportProviders.CreateDefault();
 
-var application =
-    new EchoApplication();
+var application = new EchoApplication();
 
-var engineOptions =
-    new TransportEngineOptions
-    {
-        InitialWorkerCount = Environment.ProcessorCount,
-    };
+var engineOptions = new TransportEngineOptions
+{
+    InitialWorkerCount = Environment.ProcessorCount,
+};
 
-using TransportEngine engine =
-    provider.CreateEngine(
-        engineOptions,
-        application);
+using TransportEngine engine = provider.CreateEngine(engineOptions, application);
 
-using TransportListener listener =
-    engine.Listen(
-        new TransportListenOptions
-        {
-            EndPoint =
-                new IPEndPoint(
-                    IPAddress.Any,
-                    5000),
-        });
+using TransportListener listener = engine.Listen(new TransportListenOptions
+{
+    EndPoint = new IPEndPoint(IPAddress.Any, 5000),
+});
 ```
 
 Their roles are different:
@@ -211,11 +200,9 @@ Disposing it stops new accepts but does not close `TransportConnection` instance
 The higher-level Pipelines adapter converts this callback-oriented server path into `AcceptAsync`:
 
 ```csharp
-await using TransportPipeListener listener =
-    pipeEngine.Listen(options);
+await using TransportPipeListener listener = pipeEngine.Listen(options);
 
-TransportPipeConnection? connection =
-    await listener.AcceptAsync();
+TransportPipeConnection? connection = await listener.AcceptAsync();
 ```
 
 Internally, its engine-wide application receives `OnReady`, creates a `TransportPipeConnection`, and places it in the corresponding listener's accept queue.
@@ -229,18 +216,14 @@ The application is not a connection and does not mean that application business 
 One application instance may therefore receive callbacks for many listeners and connections concurrently. Callback contexts identify the relevant listener, connection, connect operation, or write operation. Per-connection adapter state is normally stored in `TransportConnection.State`:
 
 ```csharp
-protected override void OnReady(
-    ref TransportReadyContext context)
+protected override void OnReady(ref TransportReadyContext context)
 {
-    context.Connection.State =
-        new ProtocolConnection(context.Connection);
+    context.Connection.State = new ProtocolConnection(context.Connection);
 }
 
-protected override void OnReceive(
-    ref TransportReceiveContext context)
+protected override void OnReceive(ref TransportReceiveContext context)
 {
-    var connection =
-        (ProtocolConnection)context.Connection.State!;
+    var connection = (ProtocolConnection)context.Connection.State!;
 
     connection.OnReceive(ref context);
 }
@@ -260,24 +243,19 @@ public static class TransportProviders
 {
     public static TransportProvider CreateDefault();
 
-    public static TransportProvider ManagedSockets(
-        Sockets.ManagedSocketTransportOptions? options = null);
+    public static TransportProvider ManagedSockets(Sockets.ManagedSocketTransportOptions? options = null);
 
     [SupportedOSPlatform("linux")]
-    public static TransportProvider Epoll(
-        Epoll.EpollTransportOptions? options = null);
+    public static TransportProvider Epoll(Epoll.EpollTransportOptions? options = null);
 
     [SupportedOSPlatform("linux")]
-    public static TransportProvider IoUring(
-        IoUring.IoUringTransportOptions? options = null);
+    public static TransportProvider IoUring(IoUring.IoUringTransportOptions? options = null);
 
     [SupportedOSPlatform("windows")]
-    public static TransportProvider WindowsIocp(
-        Iocp.IocpTransportOptions? options = null);
+    public static TransportProvider WindowsIocp(Iocp.IocpTransportOptions? options = null);
 
     [SupportedOSPlatform("windows")]
-    public static TransportProvider WindowsRio(
-        Rio.RioTransportOptions? options = null);
+    public static TransportProvider WindowsRio(Rio.RioTransportOptions? options = null);
 }
 
 [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
@@ -288,9 +266,7 @@ public abstract class TransportProvider
     public abstract string Name { get; }
     public abstract bool IsSupported { get; }
 
-    public abstract TransportEngine CreateEngine(
-        TransportEngineOptions options,
-        ITransportApplication application);
+    public abstract TransportEngine CreateEngine(TransportEngineOptions options, ITransportApplication application);
 }
 ```
 
@@ -417,32 +393,23 @@ public abstract class TransportApplication : ITransportApplication
 {
     protected TransportApplication();
 
-    protected virtual void OnAccepting(
-        ref TransportAcceptingContext context);
+    protected virtual void OnAccepting(ref TransportAcceptingContext context);
 
-    protected virtual void OnReady(
-        ref TransportReadyContext context);
+    protected virtual void OnReady(ref TransportReadyContext context);
 
-    protected virtual void OnConnectFailed(
-        ref TransportConnectFailedContext context);
+    protected virtual void OnConnectFailed(ref TransportConnectFailedContext context);
 
-    protected virtual void OnReceive(
-        ref TransportReceiveContext context);
+    protected virtual void OnReceive(ref TransportReceiveContext context);
 
-    protected virtual void OnWriteCompleted(
-        ref TransportWriteCompletedContext context);
+    protected virtual void OnWriteCompleted(ref TransportWriteCompletedContext context);
 
-    protected virtual void OnClosed(
-        ref TransportClosedContext context);
+    protected virtual void OnClosed(ref TransportClosedContext context);
 
-    protected virtual void OnListenerClosed(
-        ref TransportListenerClosedContext context);
+    protected virtual void OnListenerClosed(ref TransportListenerClosedContext context);
 
-    protected virtual void OnWorkerFaulted(
-        ref TransportWorkerFaultedContext context);
+    protected virtual void OnWorkerFaulted(ref TransportWorkerFaultedContext context);
 
-    protected virtual void OnBatchCompleted(
-        int workerIndex);
+    protected virtual void OnBatchCompleted(int workerIndex);
 
     void ITransportApplication.OnAccepting(ref TransportAcceptingContext context);
     void ITransportApplication.OnReady(ref TransportReadyContext context);
@@ -517,11 +484,9 @@ public abstract class TransportEngine : IDisposable
     public abstract TransportEngineOptions Options { get; }
     public abstract int WorkerCount { get; }
 
-    public abstract TransportListener Listen(
-        TransportListenOptions options);
+    public abstract TransportListener Listen(TransportListenOptions options);
 
-    public abstract TransportConnectOperation Connect(
-        TransportConnectOptions options);
+    public abstract TransportConnectOperation Connect(TransportConnectOptions options);
 
     public abstract void Dispose();
 }
@@ -696,20 +661,13 @@ public abstract class TransportConnection : IBufferWriter<byte>
     public abstract Memory<byte> GetMemory(int sizeHint = 0);
     public abstract void Advance(int count);
 
-    public abstract TransportWriteOperation Flush(
-        object? state = null);
+    public abstract TransportWriteOperation Flush(object? state = null);
 
-    public virtual TransportWriteOperation Send(
-        ReadOnlySpan<byte> data,
-        object? state = null);
+    public virtual TransportWriteOperation Send(ReadOnlySpan<byte> data, object? state = null);
 
-    public virtual TransportWriteOperation Send(
-        in ReadOnlySequence<byte> data,
-        object? state = null);
+    public virtual TransportWriteOperation Send(in ReadOnlySequence<byte> data, object? state = null);
 
-    public abstract TransportWriteOperation SendBorrowed(
-        in ReadOnlySequence<byte> data,
-        object? state = null);
+    public abstract TransportWriteOperation SendBorrowed(in ReadOnlySequence<byte> data, object? state = null);
 
     public abstract void ShutdownRead();
     public abstract void ShutdownWrite();
@@ -908,13 +866,9 @@ public sealed class TransportServerTlsOptions
     public TransportTlsOffloadOptions Offload { get; init; } = new();
 }
 
-public delegate void TransportClientHelloCallback(
-    ref TransportClientHelloContext context);
+public delegate void TransportClientHelloCallback(ref TransportClientHelloContext context);
 
-public delegate ValueTask<SslServerAuthenticationOptions>
-    TransportServerOptionsSelectionCallback(
-        TransportServerOptionsSelectionContext context,
-        CancellationToken cancellationToken);
+public delegate ValueTask<SslServerAuthenticationOptions> TransportServerOptionsSelectionCallback(TransportServerOptionsSelectionContext context, CancellationToken cancellationToken);
 
 public readonly ref struct TransportClientHelloContext
 {
@@ -991,30 +945,26 @@ This is the same consumer API as epoll, io_uring, IOCP, and RIO. The managed pro
 Consumer protocol and TLS code does not change. Only provider creation and provider resource options change.
 
 ```csharp
-TransportProvider provider = TransportProviders.IoUring(
-    new IoUringTransportOptions
-    {
-        RingEntryCount = 4096,
-        ProvidedBufferCount = 512,
-        ReceiveBufferSize = 4096,
-        WriteBufferSize = 16384,
-    });
+TransportProvider provider = TransportProviders.IoUring(new IoUringTransportOptions
+{
+    RingEntryCount = 4096,
+    ProvidedBufferCount = 512,
+    ReceiveBufferSize = 4096,
+    WriteBufferSize = 16384,
+});
 
-using TransportEngine engine = provider.CreateEngine(
-    new TransportEngineOptions
-    {
-        InitialWorkerCount = Environment.ProcessorCount,
-        MaximumConnectionsPerWorker = 4096,
-        PinWorkerThreads = true,
-    },
-    application);
+using TransportEngine engine = provider.CreateEngine(new TransportEngineOptions
+{
+    InitialWorkerCount = Environment.ProcessorCount,
+    MaximumConnectionsPerWorker = 4096,
+    PinWorkerThreads = true,
+}, application);
 
-using TransportListener listener = engine.Listen(
-    new TransportListenOptions
-    {
-        EndPoint = new IPEndPoint(IPAddress.Any, 8443),
-        Tls = serverTls,
-    });
+using TransportListener listener = engine.Listen(new TransportListenOptions
+{
+    EndPoint = new IPEndPoint(IPAddress.Any, 8443),
+    Tls = serverTls,
+});
 ```
 
 Changing `IoUring` to `Epoll`, `WindowsIocp`, `WindowsRio`, or `ManagedSockets` changes provider construction and valid provider options, not connection callback code.
