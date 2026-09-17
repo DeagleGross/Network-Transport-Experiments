@@ -16,7 +16,7 @@ public static class IoUringPlaintext
                 ReceiveBufferSize = 4096,
                 WriteBufferSize = 16384,
                 WriteBufferCount = 1024,
-                MaximumBorrowedReceiveBuffers = 128,
+                MaximumRetainedReceiveBuffers = 128,
                 ReusePort = true,
             });
 

@@ -227,6 +227,10 @@ public abstract class TransportConnection : IBufferWriter<byte>
         object? state = null)
         => throw new NotImplementedException();
 
+    public abstract TransportWriteOperation SendBorrowed(
+        in ReadOnlySequence<byte> data,
+        object? state = null);
+
     public abstract void ShutdownRead();
     public abstract void ShutdownWrite();
     public abstract void Abort(Exception? error = null);
@@ -241,6 +245,17 @@ public readonly struct TransportWriteOperation : IEquatable<TransportWriteOperat
     public bool Equals(TransportWriteOperation other) => Id == other.Id;
     public override bool Equals(object? obj) => obj is TransportWriteOperation other && Equals(other);
     public override int GetHashCode() => Id.GetHashCode();
+}
+
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public abstract class TransportReceiveLease : IDisposable
+{
+    protected TransportReceiveLease()
+    {
+    }
+
+    public abstract ReadOnlySequence<byte> Buffer { get; }
+    public abstract void Dispose();
 }
 
 [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
@@ -271,6 +286,14 @@ public ref struct TransportReceiveContext
     public TransportConnection Connection => throw new NotImplementedException();
     public ReadOnlySpan<byte> Payload => throw new NotImplementedException();
     public bool IsCompleted { get; }
+
+    public bool TryRetainPayload(
+        [NotNullWhen(true)] out TransportReceiveLease? lease)
+    {
+        lease = null;
+        return false;
+    }
+
     public Span<byte> GetResponseSpan(int sizeHint = 0) => throw new NotImplementedException();
     public int ResponseBytes { get; set; }
     public void StopReceiving()

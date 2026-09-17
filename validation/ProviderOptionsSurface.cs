@@ -35,7 +35,7 @@ namespace System.Net.Transport.IoUring
         public int WriteBufferSize { get; set; } = 4096;
         public int WriteBufferCount { get; set; } = 1024;
         public int OutOfBandWriteBufferCount { get; set; } = 256;
-        public int MaximumBorrowedReceiveBuffers { get; set; } = 128;
+        public int MaximumRetainedReceiveBuffers { get; set; } = 128;
         public bool ReusePort { get; set; } = true;
     }
 }

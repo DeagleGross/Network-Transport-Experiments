@@ -9,6 +9,7 @@
 ## Navigation
 
 - [Proposed API and contracts](api.md)
+- [Pipelines adapter proposal](pipelines-adapter.md)
 - [Provider usage examples](examples/README.md)
 - [SocketSet public API and layer map](socketset-public-api-map.md)
 - [TLS option and callback parity](tls.md)
@@ -99,7 +100,7 @@ Ordinary applications should continue to use `TcpClient`, `Socket`, `NetworkStre
 - Let callers choose managed Socket, epoll, io_uring, IOCP, RIO, or an automatic default.
 - Use the same server and client programming model with every provider.
 - Notify the application when a connection is accepted, connected, receives data, finishes a write, or closes.
-- Keep receive buffers valid for the duration of the receive callback.
+- Keep receive buffers valid for the duration of the receive callback and permit a bounded retained lease when an adapter must reference the same received bytes afterward.
 - Let applications build and submit writes without creating a Task for every write.
 - Configure TLS before a connection becomes ready, while preserving the existing .NET TLS options and callbacks.
 - Make the managed Socket provider a normal implementation of the design, not a special fallback API.
@@ -276,16 +277,22 @@ The provider invokes `TransportApplication.OnReceive(ref TransportReceiveContext
 This shape is deliberate:
 
 - epoll can invoke the callback over its per-connection receive buffer;
-- io_uring can invoke it over the CQE-selected provided buffer and return that buffer after the callback;
+- io_uring can invoke it over the CQE-selected provided buffer and return that buffer after the callback or retained-lease disposal;
 - IOCP/RIO can invoke it over the completed registered/overlapped buffer;
 - the managed provider can invoke it from SAEA completion processing;
 - `ref struct` callback contexts prevent the callback object and its buffer from being stored for later use.
 
-An adapter that cannot consume synchronously copies or adopts the payload before returning. If it applies backpressure, it asks the connection to pause receiving and resumes it after downstream capacity returns.
+An adapter that cannot consume synchronously can call `TryRetainPayload`. On success, it receives a `TransportReceiveLease` whose `ReadOnlySequence<byte>` references the same provider buffer and remains valid until disposal. On failure, the adapter copies before returning. If it applies backpressure, it asks the connection to pause receiving and resumes it after downstream capacity returns.
+
+The lease is intentionally storage-neutral. It does not expose an io_uring buffer ID, native address, writable memory, or a protocol-specific buffer such as Orleans `ArcBuffer`. A protocol library can parse the read-only sequence directly or wrap the lease in its own reference-counted segment/page owner. This permits the runtime provider to own registration, multishot receive, cancellation, and buffer-ring replenishment while the protocol library owns framing and the lifetime of bytes retained by messages.
+
+Connection close and engine disposal do not invalidate outstanding leases. During shutdown, a provider detaches retained storage from reusable native pools and lets each lease release that storage independently. Engine disposal therefore does not wait forever for an application-held lease, and the application never observes freed memory through a still-live lease.
 
 ### Write
 
-`TransportConnection` implements `IBufferWriter<byte>`. The caller composes bytes into provider-owned memory and calls `Flush`, or uses a copying `Send` helper. `Flush` returns a `TransportWriteOperation` value used to correlate `OnWriteCompleted`.
+`TransportConnection` implements `IBufferWriter<byte>`. The caller composes bytes into provider-owned memory and calls `Flush`, uses a copying `Send` helper, or submits an existing stable `ReadOnlySequence<byte>` through `SendBorrowed`. `Flush` and both send forms return a `TransportWriteOperation` value used to correlate `OnWriteCompleted`.
+
+For `SendBorrowed`, the caller keeps the sequence readable and unchanged until `OnWriteCompleted`. This permits an Orleans-style transport to submit its existing reference-counted serialized `ArcBuffer` segments without copying and to release or reroute the logical messages only after terminal completion. The provider may use scatter/gather, registered buffers, or a zero-copy native path, but is free to copy when required.
 
 The provider handles partial native sends internally and preserves logical write ordering. The core allocates no Task for write completion. A higher-level adapter can map operation IDs to Task completion sources.
 
@@ -401,12 +408,12 @@ See [backends.md](backends.md) for concrete mappings and unresolved io_uring cho
 
 ## Pipelines and Kestrel
 
-The Pipelines API is now deliberately **above** the callback core and is not part of the revised reference surface yet. A future `System.Net.Transport.Pipelines` adapter subscribes through a `TransportApplication` implementation and maps operation IDs to its own async waiters.
+The Pipelines API is deliberately **above** the callback core and is specified separately in the experimental [System.Net.Transport.Pipelines proposal](pipelines-adapter.md). The adapter owns the internal `TransportApplication`, maps operation IDs to async waiters, and exposes `TransportPipeConnection` as an `IDuplexPipe`.
 
 The baseline adapter has two pumps:
 
-- receive side: `OnReceive` copies or adopts the borrowed payload into the inbound `PipeWriter`; an incomplete `FlushAsync` pauses the connection before returning from the callback or as soon as the provider permits;
-- send side: an outbound `PipeReader` composes bytes through `TransportConnection`, calls `Flush`, and maps `TransportWriteOperation.Id` to `OnWriteCompleted`.
+- receive side: readiness providers can attach a receive sink and write directly into pipe memory; completion-selected providers can retain their filled buffers as custom `PipeReader` segments; the universal fallback copies `OnReceive.Payload` into pipe-owned memory;
+- send side: an outbound `PipeReader` either composes bytes through `TransportConnection` and calls `Flush`, or retains its sequence and calls `SendBorrowed`; it maps `TransportWriteOperation.Id` to `OnWriteCompleted`.
 
 Backpressure remains real: the adapter calls `TryPauseReceive` when the application is behind and `ResumeReceive` after the flush drains. A provider that already armed multishot receives may deliver bounded completions already in flight, but it must stop rearming or cancel/park the receive before its configured bound is exceeded.
 
@@ -491,6 +498,7 @@ See [tls.md](tls.md#ktls-and-hardware-offload) for the full contract.
 
 - Add the core abstract contracts and the managed `Socket` provider in an assembly location that can reuse runtime TLS internals without `InternalsVisibleTo` or `UnsafeAccessor`.
 - Add the Pipelines adapter.
+- Add one message-framing adapter experiment that retains provider receive leases beyond the callback and releases them when the parsed message no longer references those bytes.
 - Use `SslStream` as the TLS implementation.
 - Add a Kestrel experimental adapter without changing the default transport.
 - Add a client proof through a long-lived multiplexed protocol.
@@ -526,8 +534,8 @@ Stabilize only the smallest surface demonstrated by at least two independent con
 The proposal should not be considered implementation-complete until all applicable criteria pass:
 
 1. Plaintext echo, half-close, abort, peer EOF, connect failure, connect cancellation, and listener disposal behave identically across providers.
-2. Receive callbacks are serialized per connection, borrowed payload is valid for exactly the callback, and logical writes complete in submission order.
-3. No receive buffer ID or connection slot is reused before its callback and native terminal completion are finished.
+2. Receive callbacks are serialized per connection, borrowed payload is valid for exactly the callback, retained payload remains readable and unchanged until lease disposal, borrowed outbound sequences remain owned by the caller until terminal completion, and logical writes complete in submission order.
+3. No receive buffer ID or connection slot is reused before its callback, retained lease, and native terminal completion are finished.
 4. Every property in the current `SslClientAuthenticationOptions` and `SslServerAuthenticationOptions` surface is implemented, explicitly rejected, or routed to the documented `SslStream` fallback.
 5. Every Kestrel callback and feature in [tls.md](tls.md) has a passing parity test or an explicit bind-time incompatibility.
 6. Application callback exceptions fail only the affected connection; application callbacks are documented as nonblocking provider-worker code, while async TLS option callbacks suspend only their handshake.
@@ -537,6 +545,8 @@ The proposal should not be considered implementation-complete until all applicab
 10. The Pipelines adapter proves bounded memory under a slow reader and preserves final buffered data on completion.
 11. Client tests cover hostname validation, custom validation, client certificate selection, cancellation, server close, reconnect, and long-lived pipelining.
 12. Performance claims, if any, include an in-process control, fast-path counters, multiple payload sizes, concurrency, tail latency, CPU, and memory. A clean correctness result is not a performance result.
+13. Retained-receive tests cover callback return, connection abort, provider shutdown, lease disposal races, pool exhaustion, fallback copying, and delayed release by a message-framing consumer.
+14. Borrowed-send tests cover segmented input, partial native writes, caller disposal after completion, connection abort, provider shutdown, zero-copy notification completion, and provider fallback copying.
 
 ## Explicit limitations and unresolved decisions
 

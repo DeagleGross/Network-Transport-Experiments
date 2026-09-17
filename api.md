@@ -11,7 +11,7 @@ The core transport API should follow the useful part of SocketSet's model:
 - one engine owns shared provider resources;
 - `Listen` and `Connect` synchronously submit control-plane work;
 - accept, connect, receive, write completion, TLS progression, and close are callbacks;
-- receive buffers are borrowed only for the callback;
+- receive buffers are borrowed only for the callback by default, with an optional bounded retained lease for adapters that must keep the received bytes;
 - a connection is stable identity, outbound writer, close control, backpressure control, and metadata;
 - TLS is selected as connection policy and driven by the engine/provider, not invoked as a high-level method on the connection;
 - async APIs are optional adapters.
@@ -29,7 +29,7 @@ This does **not** make the implementation synchronous. epoll, io_uring, IOCP, RI
 7. ClientHello observation is a callback raised by the TLS handshake state machine, not a separate consumer invocation.
 8. Built-in provider implementations remain internal; consumers select them through one provider-level API.
 9. The managed provider uses ordinary `System.Net.Sockets.Socket` and `SocketAsyncEventArgs` while presenting exactly the same callbacks as native providers.
-10. Higher-level async and Pipelines adapters can be implemented without changing the core provider contract.
+10. Higher-level async, Pipelines, and message-framing adapters can retain provider receive storage and submit stable segmented writes without changing the core provider contract.
 
 ## Assembly map
 
@@ -230,7 +230,7 @@ namespace System.Net.Transport.IoUring
         public int WriteBufferSize { get; set; } = 4096;
         public int WriteBufferCount { get; set; } = 1024;
         public int OutOfBandWriteBufferCount { get; set; } = 256;
-        public int MaximumBorrowedReceiveBuffers { get; set; } = 128;
+        public int MaximumRetainedReceiveBuffers { get; set; } = 128;
         public bool ReusePort { get; set; } = true;
     }
 }
@@ -337,7 +337,8 @@ Callback rules:
 
 - callbacks for one connection are serialized on its owning provider context;
 - callbacks for different connections may run concurrently;
-- callback buffers are borrowed and cannot escape the callback;
+- callback buffers are borrowed and cannot escape the callback unless `TryRetainPayload` succeeds;
+- a retained payload lease may escape the callback, but the provider does not reuse its storage until the lease is disposed;
 - an exception from application code fails only that connection and is reported through `OnClosed`;
 - `OnWorkerFaulted` is reserved for a provider-wide worker failure;
 - `OnBatchCompleted` permits protocol adapters to coalesce work at provider-batch granularity.
@@ -526,6 +527,10 @@ public abstract class TransportConnection : IBufferWriter<byte>
         in ReadOnlySequence<byte> data,
         object? state = null);
 
+    public abstract TransportWriteOperation SendBorrowed(
+        in ReadOnlySequence<byte> data,
+        object? state = null);
+
     public abstract void ShutdownRead();
     public abstract void ShutdownWrite();
     public abstract void Abort(Exception? error = null);
@@ -539,6 +544,15 @@ public readonly struct TransportWriteOperation :
     public object? State { get; }
     public bool IsValid { get; }
 }
+
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public abstract class TransportReceiveLease : IDisposable
+{
+    protected TransportReceiveLease();
+
+    public abstract ReadOnlySequence<byte> Buffer { get; }
+    public abstract void Dispose();
+}
 ```
 
 Write contract:
@@ -547,6 +561,8 @@ Write contract:
 - `Advance` commits bytes to the current composition;
 - `Flush` submits one logical write and returns its correlation handle;
 - `Send` copies into provider-owned memory and flushes;
+- `SendBorrowed` submits a caller-owned sequence which must remain readable and unchanged until `OnWriteCompleted`;
+- a provider may pin and scatter/gather the borrowed sequence, use registered or zero-copy send paths, or copy internally; the API promises lifetime and logical completion semantics, not a specific zero-copy mechanism;
 - writes are ordered;
 - `OnWriteCompleted` fires once per logical flush after all partial native writes complete;
 - the callback carries success or failure and the original operation/state;
@@ -564,6 +580,8 @@ public ref struct TransportReceiveContext
     public TransportConnection Connection { get; }
     public ReadOnlySpan<byte> Payload { get; }
     public bool IsCompleted { get; }
+
+    public bool TryRetainPayload([NotNullWhen(true)] out TransportReceiveLease? lease);
 
     public Span<byte> GetResponseSpan(int sizeHint = 0);
     public int ResponseBytes { get; set; }
@@ -584,7 +602,15 @@ public ref struct TransportWriteCompletedContext
 
 Receive contract:
 
-- `Payload` is borrowed for the callback and cannot be retained;
+- `Payload` is borrowed for the callback and cannot itself be retained;
+- `TryRetainPayload` optionally transfers the callback payload into a provider-owned `TransportReceiveLease` over the same bytes, without copying;
+- `TryRetainPayload` returns `false` when the selected provider cannot retain that receive or when its documented retained-buffer bound has been reached; it does not return a copied lease;
+- a successful lease may outlive the callback, and its `Buffer` remains readable and unchanged until `Dispose`;
+- disposing the lease releases the entire retained payload; consumers retain only the leases that cover bytes still referenced by their parser or messages;
+- connection close and engine disposal do not invalidate an outstanding lease; on shutdown the provider detaches retained storage from reusable native pools so engine disposal does not wait indefinitely for application-held leases;
+- `Dispose` is idempotent, and accessing `Buffer` after disposal throws `ObjectDisposedException`;
+- the lease exposes managed sequence positions, not file descriptors, ring IDs, buffer-group IDs, CQE flags, native addresses, or writable memory;
+- retaining a payload does not pause future receives by itself; slow consumers still use `TryPauseReceive`, and providers must bound completed and retained receive storage;
 - `IsCompleted` means no later receive callback will carry payload;
 - writing an immediate response into `GetResponseSpan` avoids an additional composition step;
 - `ResponseBytes` may not exceed the returned span;
@@ -843,13 +869,14 @@ Examples:
 
 - a client adapter stores a `TaskCompletionSource` keyed by `TransportConnectOperation.Id` and completes it from `OnReady` or `OnConnectFailed`;
 - a write adapter stores a waiter keyed by `TransportWriteOperation.Id` and completes it from `OnWriteCompleted`;
-- a Pipelines adapter copies or adopts `OnReceive` data and pauses receiving when `FlushAsync` applies backpressure;
+- a message transport can submit its existing reference-counted serialized sequence through `SendBorrowed` and release or reroute its logical messages after terminal completion;
+- a Pipelines or message-framing adapter first tries to retain `OnReceive` data and otherwise copies it, then pauses receiving when downstream backpressure applies;
 - a Stream adapter serializes one read waiter and one write waiter;
 - Kestrel implements `IConnectionListener.AcceptAsync` over the listener callbacks.
 
 These adapters can offer cancellation tokens because they own the waiter and can call the core operation's cancellation or abort mechanism. The core provider still retains native state until terminal completion.
 
-The adapter API should be designed after the callback core has a working managed implementation. It is intentionally not included in the reference surface above.
+The candidate adapter API is specified separately in [pipelines-adapter.md](pipelines-adapter.md). It remains outside the core reference surface because its async listener, connection, scheduler, direct receive sink, custom retained input reader, and graceful-close behavior need implementation evidence before they can constrain the low-level transport.
 
 ## How this fixes the SocketSet issues
 
@@ -877,6 +904,7 @@ The adapter API should be designed after the callback core has a working managed
 6. Which provider options have a real user scenario versus being benchmark-only implementation knobs?
 7. Does the first public SPI support third-party providers, or only built-in provider selection while the SPI incubates internally?
 8. What internal or public TLS boundary lets a separate `System.Net.Transport.dll` reuse runtime TLS implementation without exposing provider strategy to consumers?
+9. Should retained receive leases initially be available only to runtime-owned adapters, or should the experimental public contract permit third-party consumers after provider bounds and misuse behavior are validated?
 
 ## API evolution rule
 

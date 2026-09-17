@@ -44,11 +44,11 @@ The common API intentionally hides native identifiers, but the SPI implementatio
 
 | Backend | Native operation identity | Buffer identity | Safe reuse point |
 |---|---|---|---|
-| Managed `Socket`/SAEA | `SocketAsyncEventArgs` instance or runtime async operation object | SAEA buffer or provider pool lease | `OnReceive` has returned and no attached adapter retains the data |
-| epoll | Registered fd plus connection generation and current interest state | Provider pool slot used by the synchronous `recv` performed after readiness | `OnReceive` has returned |
-| io_uring | CQE `user_data` encoding operation kind, connection slot, and generation | CQE buffer ID from `IORING_CQE_F_BUFFER`, plus buffer group | `OnReceive` has returned and the buffer is returned to the ring; operation identity remains until the final CQE without `F_MORE` |
-| IOCP | OVERLAPPED address plus connection slot/generation | Receive buffer associated with the OVERLAPPED | Completion dequeued and `OnReceive` has returned |
-| RIO | RIO request/completion identity plus connection generation | Registered buffer ID and offset | Completion drained and `OnReceive` has returned |
+| Managed `Socket`/SAEA | `SocketAsyncEventArgs` instance or runtime async operation object | SAEA buffer or provider pool lease | `OnReceive` has returned and any `TransportReceiveLease` is disposed |
+| epoll | Registered fd plus connection generation and current interest state | Provider pool slot used by the synchronous `recv` performed after readiness | `OnReceive` has returned and any `TransportReceiveLease` is disposed |
+| io_uring | CQE `user_data` encoding operation kind, connection slot, and generation | CQE buffer ID from `IORING_CQE_F_BUFFER`, plus buffer group | `OnReceive` has returned and any `TransportReceiveLease` is disposed; operation identity remains until the final CQE without `F_MORE` |
+| IOCP | OVERLAPPED address plus connection slot/generation | Receive buffer associated with the OVERLAPPED | Completion dequeued, `OnReceive` has returned, and any `TransportReceiveLease` is disposed |
+| RIO | RIO request/completion identity plus connection generation | Registered buffer ID and offset | Completion drained, `OnReceive` has returned, and any `TransportReceiveLease` is disposed |
 
 Connection generations are not optional bookkeeping. File descriptors, socket handles, slot indexes, buffer IDs, and native memory addresses are reused. A late completion must be distinguishable from the current tenant of that reused resource.
 
@@ -173,7 +173,11 @@ This means three identities matter:
 2. operation identity: operation kind plus submission generation in `user_data`;
 3. buffer identity: buffer group and CQE buffer ID.
 
-The consumer never sees those raw values. The provider invokes `OnReceive` over the selected buffer and returns the buffer to its ring after the callback or after an attached adapter has copied/adopted it under a provider-specific internal contract.
+The consumer never sees those raw values. The provider invokes `OnReceive` over the selected buffer. Normally it returns the buffer to the ring after the callback. If `TryRetainPayload` succeeds, the provider instead associates that storage with a `TransportReceiveLease` and returns or replaces the ring buffer only after the lease is disposed. The lease exposes a read-only managed sequence and never exposes the buffer ID, group, CQE flags, or native address.
+
+This permits an Orleans-style adapter to retain kernel-filled pages without owning the ring. The adapter wraps each lease in its own reference-counted message-buffer owner, parses directly from `TransportReceiveLease.Buffer`, and disposes the lease when no message slice references it. `ArcBuffer` remains an Orleans type and is not part of `System.Net.Transport`; Orleans needs only the small wrapper which makes a lease-backed segment participate in its existing ownership model.
+
+On connection or engine shutdown, retained pages are removed from ring reuse before the ring and buffer group are destroyed. The lease remains the final owner and frees its detached page when disposed. Engine disposal must not wait for arbitrary application lease lifetime.
 
 ### Plaintext mapping
 
@@ -183,8 +187,8 @@ The consumer never sees those raw values. The provider invokes `OnReceive` over 
 | Accept identity | CQE result provides accepted fd/direct descriptor; assign slot/generation before exposure |
 | Connect | One connect SQE; preserve endpoint storage until submission/required stable lifetime |
 | Read | Multishot recv/recvmsg with provided-buffer selection, or one-shot receive; queue CQE-selected buffers into connection order |
-| Advance | Return fully consumed buffer IDs to the buffer ring; partial segment remains leased |
-| Write | send/writev SQEs; retain source pins or copied provider buffers until each terminal CQE |
+| Lease disposal | Return the retained buffer ID to the buffer ring, or free a page detached during shutdown |
+| Write | `SendBorrowed` maps to send/writev SQEs over caller-owned stable segments; retain source pins or copied provider buffers until each terminal CQE |
 | Pre-auth ClientHello | Memory-BIO mode retains the CQE-selected ciphertext record; fd-bound mode uses poll-driven ClientHello callback suspension and preserves the initialized TLS session |
 | Backpressure | Stop rearming, cancel a multishot receive by exact `user_data`, or absorb only a documented bounded number of already-produced CQEs |
 | Teardown | Cancel all operations for the fd or exact identities; hold slot and generation until every original operation posts its terminal CQE |
@@ -247,7 +251,7 @@ These are explicit design questions, not invented answers:
 2. Is multishot accept used for every listener, and how are peer/local addresses obtained without unsafe shared address storage?
 3. Does plaintext receive use multishot recv, multishot recvmsg, bundled receives, or a version-gated combination?
 4. How are CQE `user_data`, connection generation, and buffer ID encoded without truncation across architectures?
-5. Does each CQE produce one `OnReceive`, or can the provider batch several selected buffers into one callback without exposing a retained multi-segment lifetime?
+5. Does each CQE produce one `OnReceive`, or can the provider batch several selected buffers into one callback and one retained multi-segment lease?
 6. What exact bound applies to CQEs that arrive after downstream backpressure begins?
 7. Is receive parking implemented by canceling the exact multishot `user_data`, by not rearming after terminal CQE, or by another kernel feature?
 8. How does cancellation distinguish the cancellation request's CQE from the canceled operation's terminal CQE?
@@ -322,13 +326,15 @@ The common public API should not expose `EpollTlsMode`, `IoUringTlsMode`, or `Us
 
 ## Pipe adapter mapping
 
+The candidate public adapter surface, direct receive sink, retained input reader, scheduling model, and usage examples are specified in [pipelines-adapter.md](pipelines-adapter.md).
+
 ### Baseline universal bridge
 
 The baseline callback-to-Pipelines adapter works for every provider:
 
-- `OnReceive` copies provider-owned payload into the inbound pipe;
+- `OnReceive` calls `TryRetainPayload` when the adapter can represent retained provider memory, otherwise it copies provider-owned payload into the inbound pipe;
 - an incomplete inbound flush calls `TryPauseReceive`, and its continuation later calls `ResumeReceive`;
-- the outbound pipe reader composes data into `TransportConnection`, calls `Flush`, and records the returned `TransportWriteOperation`;
+- the outbound pipe reader composes data into `TransportConnection` and calls `Flush`, or holds the pipe sequence stable and calls `SendBorrowed`; it records the returned `TransportWriteOperation`;
 - `OnWriteCompleted` advances the outbound pipe and completes the matching adapter waiter;
 - already completed native reads are bounded by provider pool size;
 - errors complete both pipe directions and abort the connection;
@@ -336,14 +342,14 @@ The baseline callback-to-Pipelines adapter works for every provider:
 
 ### Optimized adapters
 
-A built-in provider may implement an internal optimized adapter:
+A built-in or external adapter may use retained receive leases without learning the selected backend:
 
-- epoll can obtain inbound pipe memory after readiness and `recv` directly into it;
-- io_uring can expose CQE-selected buffers through a custom `PipeReader` whose `AdvanceTo` returns buffer IDs;
-- IOCP can receive into pipe-pool memory held stable for OVERLAPPED lifetime;
-- outbound sequences can be sent by scatter/gather when the backend supports it.
+- epoll can lease the provider pool memory filled by `recv`;
+- io_uring can lease CQE-selected buffers through a custom `PipeReader` or message buffer whose release disposes the lease;
+- IOCP can lease receive memory held stable for OVERLAPPED lifetime;
+- outbound sequences submitted through `SendBorrowed` can be sent by scatter/gather, registered-buffer, or zero-copy paths when the backend supports them.
 
-These optimizations must preserve the same public adapter semantics and be independently observable in benchmarks. The first public SPI does not expose a generic "zero-copy" capability flag.
+These optimizations must preserve the same public adapter semantics and be independently observable in benchmarks. `TryRetainPayload` is the capability probe; the API does not claim that every provider or every receive can retain, and it does not expose a generic "zero-copy" flag.
 
 ## Failure isolation
 

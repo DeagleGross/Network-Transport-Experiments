@@ -118,7 +118,7 @@
 +    public int WriteBufferSize { get; set; }
 +    public int WriteBufferCount { get; set; }
 +    public int OutOfBandWriteBufferCount { get; set; }
-+    public int MaximumBorrowedReceiveBuffers { get; set; }
++    public int MaximumRetainedReceiveBuffers { get; set; }
 +    public bool ReusePort { get; set; }
 +}
 
@@ -271,10 +271,12 @@
 - Keep receive delivery exclusively in `OnReceive`.
 - Keep provider-owned `IBufferWriter<byte>` composition and synchronous submission.
 - Return a write operation handle from each logical flush.
+- Add `SendBorrowed` for stable caller-owned segmented buffers that remain valid through terminal write completion.
 - Keep receive pause/resume and explicit half-close/abort.
 - Do not expose raw handles or generic socket options.
+- Add an optional retained receive lease so protocol adapters can hold the exact provider buffer beyond `OnReceive` without exposing backend identities.
 
-**Why:** This is the strongest distinction from `Socket`: the provider owns receive buffers and invokes the application at completion time. A task-based caller-buffer API would duplicate `Socket.ReceiveAsync` and weaken the case for a new surface. The write-operation handle fixes callback correlation while preserving an allocation-free core. Raw handles would permit a second I/O owner and break ordering or TLS framing.
+**Why:** This is the strongest distinction from `Socket`: the provider owns receive buffers and invokes the application at completion time. A task-based caller-buffer API would duplicate `Socket.ReceiveAsync` and weaken the case for a new surface. The write-operation handle fixes callback correlation while preserving an allocation-free core. `SendBorrowed` lets protocol libraries keep using their reference-counted serialized segments and permits provider-private scatter/gather or zero-copy paths without promising them. A bounded retained lease lets message-framing and Pipelines adapters preserve provider-selected receive memory after the callback instead of copying, while the provider still owns registration and reuse. Raw handles would permit a second I/O owner and break ordering or TLS framing.
 
 ```diff
  namespace System.Net.Transport;
@@ -298,6 +300,7 @@
 +    public abstract TransportWriteOperation Flush(object? state = null);
 +    public virtual TransportWriteOperation Send(ReadOnlySpan<byte> data, object? state = null);
 +    public virtual TransportWriteOperation Send(in ReadOnlySequence<byte> data, object? state = null);
++    public abstract TransportWriteOperation SendBorrowed(in ReadOnlySequence<byte> data, object? state = null);
 +    public abstract void ShutdownRead();
 +    public abstract void ShutdownWrite();
 +    public abstract void Abort(Exception? error = null);
@@ -309,6 +312,13 @@
 +    public object? State { get; }
 +    public bool IsValid { get; }
 +}
++
++public abstract class TransportReceiveLease : IDisposable
++{
++    protected TransportReceiveLease();
++    public abstract ReadOnlySequence<byte> Buffer { get; }
++    public abstract void Dispose();
++}
 ```
 
 ### Callback context types
@@ -318,8 +328,9 @@
 - Include initial/next-write fast paths as optional context members.
 - Include the connect operation, listener, and origin where applicable.
 - Keep receive EOF separate from terminal connection close.
+- Let a receive callback try to retain the same read-only bytes under a provider-owned lease; do not expose writable memory or native buffer identities.
 
-**Why:** Lexical buffer lifetime is the main safety and efficiency benefit of the callback model. Contexts also avoid allocating a result object for each completion. The immediate-response and next-write paths are useful, but they must be bounded and safe by default; the runtime API should not expose SocketSet's sharp unwiped escape hatch.
+**Why:** Lexical buffer lifetime remains the safe allocation-free default. Some infrastructure consumers, however, deliberately retain framed-message slices after native completion. Requiring those consumers to copy would prevent reuse of the provider's registered-buffer engine. `TryRetainPayload` makes that uncommon path explicit and bounded, while a read-only `TransportReceiveLease` prevents mutation and keeps io_uring buffer IDs, RIO registrations, OVERLAPPED state, and addresses private. A lease remains valid across connection and engine shutdown, so providers must detach retained storage rather than block disposal or expose freed memory. Contexts also avoid allocating a result object for each ordinary completion. The immediate-response and next-write paths are useful, but they must be bounded and safe by default; the runtime API should not expose SocketSet's sharp unwiped escape hatch.
 
 ```diff
  namespace System.Net.Transport;
@@ -347,6 +358,7 @@
 +    public TransportConnection Connection { get; }
 +    public ReadOnlySpan<byte> Payload { get; }
 +    public bool IsCompleted { get; }
++    public bool TryRetainPayload([NotNullWhen(true)] out TransportReceiveLease? lease);
 +    public Span<byte> GetResponseSpan(int sizeHint = 0);
 +    public int ResponseBytes { get; set; }
 +    public void StopReceiving();
