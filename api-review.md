@@ -361,7 +361,6 @@
 +    public bool TryRetainPayload([NotNullWhen(true)] out TransportReceiveLease? lease);
 +    public Span<byte> GetResponseSpan(int sizeHint = 0);
 +    public int ResponseBytes { get; set; }
-+    public void StopReceiving();
 +}
 +
 +public ref struct TransportWriteCompletedContext

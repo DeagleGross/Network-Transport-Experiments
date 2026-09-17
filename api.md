@@ -725,7 +725,6 @@ public ref struct TransportReceiveContext
 
     public Span<byte> GetResponseSpan(int sizeHint = 0);
     public int ResponseBytes { get; set; }
-    public void StopReceiving();
 }
 
 [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
@@ -751,6 +750,7 @@ Receive contract:
 - `Dispose` is idempotent, and accessing `Buffer` after disposal throws `ObjectDisposedException`;
 - the lease exposes managed sequence positions, not file descriptors, ring IDs, buffer-group IDs, CQE flags, native addresses, or writable memory;
 - retaining a payload does not pause future receives by itself; slow consumers still use `TryPauseReceive`, and providers must bound completed and retained receive storage;
+- receive and write progress are independent: one receive and one write may be active concurrently on a connection;
 - `IsCompleted` means no later receive callback will carry payload;
 - writing an immediate response into `GetResponseSpan` avoids an additional composition step;
 - `ResponseBytes` may not exceed the returned span;
@@ -801,31 +801,23 @@ This path is not the expected ASP.NET Core request path because HTTP parsing, mi
 
 #### Retain, dispatch, process, and send
 
-The following simplified one-message-per-connection example moves processing to an application queue. It retains the original receive storage when possible and copies only when retention is unavailable:
+The following simplified example moves received chunks to an application queue while the transport remains free to receive later chunks and send earlier responses. It retains the original receive storage when possible and copies only when retention is unavailable:
 
 ```csharp
 protected override void OnReceive(ref TransportReceiveContext context)
 {
+    ReceivedRequest request;
     if (context.Payload.IsEmpty)
     {
-        if (context.IsCompleted)
-        {
-            context.Connection.ShutdownWrite();
-        }
-
-        return;
+        request = ReceivedRequest.Completed(context.Connection);
     }
-
-    context.StopReceiving();
-
-    ReceivedRequest request;
-    if (context.TryRetainPayload(out TransportReceiveLease? lease))
+    else if (context.TryRetainPayload(out TransportReceiveLease? lease))
     {
-        request = ReceivedRequest.FromLease(context.Connection, lease);
+        request = ReceivedRequest.FromLease(context.Connection, lease, context.IsCompleted);
     }
     else
     {
-        request = ReceivedRequest.FromCopy(context.Connection, context.Payload.ToArray());
+        request = ReceivedRequest.FromCopy(context.Connection, context.Payload.ToArray(), context.IsCompleted);
     }
 
     if (!_requests.Writer.TryWrite(request))
@@ -841,18 +833,29 @@ private async Task ProcessRequestsAsync()
     {
         using (request)
         {
-            byte[] response = await _handler(request.Buffer);
+            if (!request.Buffer.IsEmpty)
+            {
+                byte[] response = await _handler(request.Buffer);
 
-            // Send copies before returning, so response does not need to remain alive
-            // until OnWriteCompleted.
-            request.Connection.Send(response);
-            request.Connection.ShutdownWrite();
+                // Send copies before returning, so response does not need to remain alive
+                // until OnWriteCompleted.
+                request.Connection.Send(response);
+            }
+
+            if (request.IsCompleted)
+            {
+                request.Connection.ShutdownWrite();
+            }
         }
     }
 }
 ```
 
 The lease is returned by `request.Dispose()` after `_handler` has finished reading `request.Buffer`. It is not tied to response completion. The response uses different outbound storage.
+
+There is deliberately no receive stop in this flow. While one retained chunk is waiting for or undergoing application processing, the provider may deliver later receive callbacks and may transmit previously submitted responses. A production adapter bounds queued bytes. It calls `TryPauseReceive` only when unconsumed input crosses its pause threshold and calls `ResumeReceive` after it falls below the resume threshold.
+
+`ShutdownRead` permanently ends the local receive direction. It is for protocol shutdown or abort behavior, not ordinary request dispatch.
 
 If the response is already held in stable segmented memory, the application can avoid the copying `Send`:
 

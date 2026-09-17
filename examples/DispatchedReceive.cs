@@ -24,26 +24,18 @@ public sealed class DispatchedReceiveApplication : TransportApplication, IAsyncD
 
     protected override void OnReceive(ref TransportReceiveContext context)
     {
+        ReceivedRequest request;
         if (context.Payload.IsEmpty)
         {
-            if (context.IsCompleted)
-            {
-                context.Connection.ShutdownWrite();
-            }
-
-            return;
+            request = ReceivedRequest.Completed(context.Connection);
         }
-
-        context.StopReceiving();
-
-        ReceivedRequest request;
-        if (context.TryRetainPayload(out TransportReceiveLease? lease))
+        else if (context.TryRetainPayload(out TransportReceiveLease? lease))
         {
-            request = ReceivedRequest.FromLease(context.Connection, lease);
+            request = ReceivedRequest.FromLease(context.Connection, lease, context.IsCompleted);
         }
         else
         {
-            request = ReceivedRequest.FromCopy(context.Connection, context.Payload.ToArray());
+            request = ReceivedRequest.FromCopy(context.Connection, context.Payload.ToArray(), context.IsCompleted);
         }
 
         if (!_requests.Writer.TryWrite(request))
@@ -73,10 +65,17 @@ public sealed class DispatchedReceiveApplication : TransportApplication, IAsyncD
         {
             using (request)
             {
-                byte[] response = await _handler(request.Buffer).ConfigureAwait(false);
+                if (!request.Buffer.IsEmpty)
+                {
+                    byte[] response = await _handler(request.Buffer).ConfigureAwait(false);
 
-                request.Connection.Send(response);
-                request.Connection.ShutdownWrite();
+                    request.Connection.Send(response);
+                }
+
+                if (request.IsCompleted)
+                {
+                    request.Connection.ShutdownWrite();
+                }
             }
         }
     }
@@ -86,25 +85,29 @@ public sealed class DispatchedReceiveApplication : TransportApplication, IAsyncD
         private readonly TransportReceiveLease? _lease;
         private readonly byte[]? _copy;
 
-        private ReceivedRequest(TransportConnection connection, TransportReceiveLease lease)
+        private ReceivedRequest(TransportConnection connection, TransportReceiveLease? lease, byte[]? copy, bool isCompleted)
         {
             Connection = connection;
             _lease = lease;
-        }
-
-        private ReceivedRequest(TransportConnection connection, byte[] copy)
-        {
-            Connection = connection;
             _copy = copy;
+            IsCompleted = isCompleted;
         }
 
         public TransportConnection Connection { get; }
 
-        public ReadOnlySequence<byte> Buffer => _lease is not null ? _lease.Buffer : new ReadOnlySequence<byte>(_copy!);
+        public ReadOnlySequence<byte> Buffer => _lease is not null
+            ? _lease.Buffer
+            : _copy is not null
+                ? new ReadOnlySequence<byte>(_copy)
+                : ReadOnlySequence<byte>.Empty;
 
-        public static ReceivedRequest FromLease(TransportConnection connection, TransportReceiveLease lease) => new(connection, lease);
+        public bool IsCompleted { get; }
 
-        public static ReceivedRequest FromCopy(TransportConnection connection, byte[] copy) => new(connection, copy);
+        public static ReceivedRequest Completed(TransportConnection connection) => new(connection, null, null, true);
+
+        public static ReceivedRequest FromLease(TransportConnection connection, TransportReceiveLease lease, bool isCompleted) => new(connection, lease, null, isCompleted);
+
+        public static ReceivedRequest FromCopy(TransportConnection connection, byte[] copy, bool isCompleted) => new(connection, null, copy, isCompleted);
 
         public void Dispose() => _lease?.Dispose();
     }

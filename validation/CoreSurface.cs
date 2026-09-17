@@ -296,9 +296,6 @@ public ref struct TransportReceiveContext
 
     public Span<byte> GetResponseSpan(int sizeHint = 0) => throw new NotImplementedException();
     public int ResponseBytes { get; set; }
-    public void StopReceiving()
-    {
-    }
 }
 
 [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]

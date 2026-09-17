@@ -720,6 +720,8 @@ private async Task ProcessSendsAsync()
 
 The provider invokes the adapter's `OnWriteCompleted`; it does not invoke the ASP.NET Core application. Completion only tells the adapter that the output-pipe memory can be advanced and reused.
 
+Ordinary dispatch does not pause the receive side. The adapter permits one receive and one write to progress concurrently, matching today's `SocketConnection`, which runs independent receive and send loops. It pauses new application receives only when the input pipe's unconsumed-byte threshold applies backpressure. Output may continue draining while input is paused.
+
 ## Backpressure
 
 Input backpressure is based on bytes made readable but not yet consumed:
