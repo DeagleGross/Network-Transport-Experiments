@@ -15,7 +15,10 @@ The examples are compiled by `NetworkTransportExamples.csproj`, which references
 | `WindowsIocpTls.cs` | Windows IOCP with provider-owned TLS |
 | `WindowsRioTls.cs` | Windows RIO registered data path with provider-owned TLS; explicit, non-default provider |
 | `DispatchedReceive.cs` | Retain-or-copy receive handoff to an application queue, followed by a later copying send |
+| `RetainedEchoApplication.cs` | Retained receive storage submitted through `SendBorrowed` and released by terminal write completion |
 
 All TLS examples configure TLS on `TransportListenOptions` or `TransportConnectOptions`. There is no consumer call to `AuthenticateAsServerAsync`: the provider drives the handshake and raises `OnReady` only after authentication succeeds.
 
 `EchoApplication.cs` shows the immediate-response path: it copies the callback payload into provider-owned output memory through `GetResponseSpan`. `DispatchedReceive.cs` shows the different lifetime used by application processing: retain or copy the input, return from `OnReceive`, continue receiving, process queued input on another scheduler, dispose each input lease after reading it, and call `TransportConnection.Send` later. Receive and write progress independently. The connection is a persistent command handle and does not require the send call to occur inside an `ITransportApplication` callback.
+
+`RetainedEchoApplication.cs` combines both ownership APIs. `TryRetainPayload` keeps the provider's receive storage alive after `OnReceive`; `SendBorrowed` uses that same read-only sequence as outbound source memory; and `OnWriteCompleted` disposes the lease only after the provider no longer references it. If receive retention is unavailable, the example falls back to the copying `Send`.

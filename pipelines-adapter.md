@@ -905,6 +905,84 @@ The protocol sees no difference between:
 - an io_uring provided buffer retained as a reader segment;
 - a copied fallback block.
 
+### How retained input and borrowed output work together
+
+The two mechanisms optimize opposite adapter boundaries:
+
+```text
+Inbound:
+provider receive buffer
+    -> TryRetainPayload
+    -> PipeReader segment
+    -> protocol reads the same memory
+    -> Input.AdvanceTo
+    -> adapter disposes receive lease
+
+Outbound:
+protocol writes to PipeWriter memory
+    -> adapter reads Output buffer
+    -> SendBorrowed
+    -> provider reads the same memory
+    -> OnWriteCompleted
+    -> adapter advances output reader
+```
+
+This avoids:
+
+1. copying provider receive memory into ordinary input-pipe memory when retention is available;
+2. copying output-pipe memory into a separate transport send buffer when borrowed send is available.
+
+It does not mean that one receive lease normally survives until an HTTP response is sent. Input and output contain different bytes and have independent lifetimes.
+
+A normal Pipelines echo still copies between the input and output sides because `PipeWriter` cannot adopt an arbitrary `ReadOnlySequence<byte>`:
+
+```csharp
+private static async Task EchoAsync(TransportPipeConnection connection)
+{
+    while (true)
+    {
+        ReadResult result = await connection.Input.ReadAsync();
+        ReadOnlySequence<byte> input = result.Buffer;
+
+        foreach (ReadOnlyMemory<byte> segment in input)
+        {
+            connection.Output.Write(segment.Span);
+        }
+
+        connection.Input.AdvanceTo(input.End);
+
+        if (!input.IsEmpty)
+        {
+            FlushResult flush = await connection.Output.FlushAsync();
+            if (flush.IsCanceled || flush.IsCompleted)
+            {
+                break;
+            }
+        }
+
+        if (result.IsCompleted)
+        {
+            break;
+        }
+    }
+}
+```
+
+Even in this example, receive retention is useful: the adapter did not copy the provider buffer merely to expose `connection.Input`. Borrowed send is also useful: after the echo code copies into `connection.Output`, the adapter can submit that output-pipe memory without another transport-layer copy.
+
+For a specialized relay whose output is exactly the input sequence, an internal adapter can avoid the input-to-output copy as well:
+
+```text
+PipeReader returns retained input sequence A
+    -> internal relay calls TransportConnection.SendBorrowed(A)
+    -> relay does not AdvanceTo(A.End) yet
+    -> OnWriteCompleted
+    -> relay advances Input to A.End
+    -> advancing disposes the receive lease behind A
+```
+
+That specialized path must keep the `ReadResult.Buffer` valid until terminal write completion, which means it cannot advance the input reader early. It is not the general `IDuplexPipe` application model and should not add a public raw-transport escape hatch to `TransportPipeConnection`.
+
 ## Client usage
 
 ```csharp
