@@ -119,6 +119,16 @@ using TransportEngine engine =
     provider.CreateEngine(
         engineOptions,
         application);
+
+using TransportListener listener =
+    engine.Listen(
+        new TransportListenOptions
+        {
+            EndPoint =
+                new IPEndPoint(
+                    IPAddress.Any,
+                    5000),
+        });
 ```
 
 Their roles are different:
@@ -129,6 +139,7 @@ Their roles are different:
 | `ITransportApplication` | Caller, normally by deriving from `TransportApplication` | Receives every lifecycle and data callback from the engine created with it. It contains adapter or protocol integration logic, not native provider resources. |
 | `TransportEngineOptions` | Caller | Configures provider-independent worker and capacity policy for one engine. |
 | `TransportEngine` | Provider when `CreateEngine` is called | Owns workers, rings, pollers, completion ports, buffer pools, listeners, connections, and the registered application callback target. |
+| `TransportListener` | Engine when `Listen` is called | Owns one bound server endpoint and its accept operations. It reports accepted connections through the engine's application. |
 
 `CreateEngine(options, application)` is the attachment point between the engine and application. The engine retains the application reference for its entire lifetime. Every listener and outbound connection created by that engine reports through that same application:
 
@@ -156,6 +167,58 @@ TransportEngine.Connect(...)
     -> OnReady
        or OnConnectFailed
 ```
+
+For a server, creating the engine only starts the shared provider resources. It does not bind a TCP endpoint. The next operation is `engine.Listen(options)`.
+
+`Listen` performs the server control-plane setup synchronously:
+
+1. validate the endpoint and listener options;
+2. create and bind the native listening socket;
+3. start listening with the requested backlog;
+4. register the listener with the selected provider worker or workers;
+5. arm the initial accept operations;
+6. return the persistent `TransportListener`.
+
+At that point the server is accepting connections. The caller does not call `AcceptAsync` on the low-level listener. Accepted connections are delivered to the application registered with the engine:
+
+```text
+engine.Listen(options)
+    -> returns TransportListener
+
+remote client connects
+    -> provider accepts TCP connection
+    -> provider creates TransportConnection
+    -> application.OnAccepting
+         can tag or reject the connection
+         can adjust the preseeded server TLS policy
+    -> provider performs TLS handshake when configured
+    -> application.OnReady
+         connection is now available for application data
+    -> application.OnReceive
+    -> application can call connection.Send or SendBorrowed
+    -> application.OnWriteCompleted
+    -> application.OnClosed
+```
+
+The returned listener controls the accept source:
+
+```csharp
+listener.Dispose();
+```
+
+Disposing it stops new accepts but does not close `TransportConnection` instances which were already delivered to the application. Disposing the engine stops every listener and terminates the remaining engine-owned connections.
+
+The higher-level Pipelines adapter converts this callback-oriented server path into `AcceptAsync`:
+
+```csharp
+await using TransportPipeListener listener =
+    pipeEngine.Listen(options);
+
+TransportPipeConnection? connection =
+    await listener.AcceptAsync();
+```
+
+Internally, its engine-wide application receives `OnReady`, creates a `TransportPipeConnection`, and places it in the corresponding listener's accept queue.
 
 The application is not a connection and does not mean that application business logic runs inside provider callbacks. It is the engine-wide callback receiver, usually implemented by an adapter:
 
