@@ -14,5 +14,8 @@ The examples are compiled by `NetworkTransportExamples.csproj`, which references
 | `IoUringTls.cs` | io_uring with provider-owned TLS; the internal TLS mechanism does not change usage |
 | `WindowsIocpTls.cs` | Windows IOCP with provider-owned TLS |
 | `WindowsRioTls.cs` | Windows RIO registered data path with provider-owned TLS; explicit, non-default provider |
+| `DispatchedReceive.cs` | Retain-or-copy receive handoff to an application queue, followed by a later copying send |
 
 All TLS examples configure TLS on `TransportListenOptions` or `TransportConnectOptions`. There is no consumer call to `AuthenticateAsServerAsync`: the provider drives the handshake and raises `OnReady` only after authentication succeeds.
+
+`EchoApplication.cs` shows the immediate-response path: it copies the callback payload into provider-owned output memory through `GetResponseSpan`. `DispatchedReceive.cs` shows the different lifetime used by application processing: retain or copy the input, return from `OnReceive`, process it on another scheduler, dispose the input lease after parsing, and call `TransportConnection.Send` later. The connection is a persistent command handle and does not require the send call to occur inside an `ITransportApplication` callback.

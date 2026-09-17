@@ -663,6 +663,63 @@ They do not run HTTP parsing, middleware, database calls, Orleans grain executio
 
 The adapter must request asynchronous continuations when completing waiters from a provider worker unless inline execution was explicitly configured.
 
+### Detailed ASP.NET Core dispatch flow
+
+The receive callback and the HTTP request are not one operation with one lifetime:
+
+```text
+1. Provider worker receives plaintext bytes.
+2. Internal adapter OnReceive retains the provider buffer or copies its payload.
+3. Adapter appends those bytes to the input reader and schedules its reader continuation.
+4. Internal OnReceive returns; the provider worker can process other completions.
+5. Kestrel's protocol loop resumes on its configured scheduler and reads Input.
+6. Kestrel parses the request and advances Input past bytes it no longer needs.
+7. Advancing releases any retained leases which are no longer visible.
+8. Kestrel dispatches the parsed request to middleware and application code.
+9. Application code writes response bytes to Output.
+10. The adapter's output reader resumes on the transport scheduler and submits those bytes.
+11. Internal OnWriteCompleted advances the output reader after terminal send completion.
+```
+
+The input lease does not normally wait for step 9. For example, HTTP request-line and header bytes can be released after parsing even if application code is still awaiting a database call. Request-body bytes remain only while the HTTP layer still exposes or buffers them.
+
+The application does not call `TransportConnection.Send` and does not implement `ITransportApplication`. Its write API remains the normal `PipeWriter`:
+
+```csharp
+connection.Output.Write("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"u8);
+await connection.Output.FlushAsync();
+```
+
+The internal adapter owns the low-level connection and callback target:
+
+```csharp
+private async Task ProcessSendsAsync()
+{
+    while (true)
+    {
+        ReadResult result = await _output.Reader.ReadAsync();
+        ReadOnlySequence<byte> buffer = result.Buffer;
+
+        if (!buffer.IsEmpty)
+        {
+            var pending = new PendingPipeSend(_output.Reader, buffer.End);
+            _transport.SendBorrowed(buffer, state: pending);
+            await pending.Completion.ConfigureAwait(false);
+        }
+
+        _output.Reader.AdvanceTo(buffer.End);
+
+        if (result.IsCompleted)
+        {
+            _transport.ShutdownWrite();
+            break;
+        }
+    }
+}
+```
+
+The provider invokes the adapter's `OnWriteCompleted`; it does not invoke the ASP.NET Core application. Completion only tells the adapter that the output-pipe memory can be advanced and reused.
+
 ## Backpressure
 
 Input backpressure is based on bytes made readable but not yet consumed:

@@ -700,6 +700,8 @@ Write contract:
 - `Flush` submits one logical write and returns its correlation handle;
 - `Send` copies into provider-owned memory and flushes;
 - `SendBorrowed` submits a caller-owned sequence which must remain readable and unchanged until `OnWriteCompleted`;
+- connection commands may be called after a callback returns and from a non-provider thread; the provider marshals the command to the connection's owning worker when necessary;
+- the caller or adapter must serialize write composition and submission for one connection; concurrent calls have no defined ordering;
 - a provider may pin and scatter/gather the borrowed sequence, use registered or zero-copy send paths, or copy internally; the API promises lifetime and logical completion semantics, not a specific zero-copy mechanism;
 - writes are ordered;
 - `OnWriteCompleted` fires once per logical flush after all partial native writes complete;
@@ -755,6 +757,153 @@ Receive contract:
 - no public unwiped-buffer escape hatch is proposed;
 - slow-consumer adapters call `TryPauseReceive` and later `ResumeReceive`;
 - provider-specific already-completed receive work remains bounded by provider options.
+
+### Dispatching received data and writing later
+
+`OnReceive` is a transport notification, not the scope in which an HTTP request, Orleans message, or other application operation must finish. The callback has three choices:
+
+1. consume `Payload` synchronously and return;
+2. retain the provider storage with `TryRetainPayload`, hand the lease to another scheduler, and dispose it after those bytes are consumed;
+3. copy `Payload` into application-owned storage, hand the copy to another scheduler, and return immediately.
+
+Only the borrowed `Payload` span expires when `OnReceive` returns. The `TransportConnection` is a persistent object and may be stored in per-connection state. Later code can call `Send`, compose through `GetMemory`/`Advance`/`Flush`, call `SendBorrowed`, pause or resume receives, or close the connection without first entering another `ITransportApplication` callback.
+
+The provider still reports terminal write completion through `OnWriteCompleted`. A direct low-level consumer can ignore successful completion after a copying `Send` if it does not need notification. An adapter must observe completion when it owns a waiter or when memory was submitted through `SendBorrowed`.
+
+#### Immediate callback response
+
+`GetResponseSpan` is an optimization for a response which is completely known during the callback, such as an echo, protocol acknowledgment, or fixed rejection:
+
+```csharp
+protected override void OnReceive(ref TransportReceiveContext context)
+{
+    if (!context.Payload.IsEmpty)
+    {
+        Span<byte> response = context.GetResponseSpan(context.Payload.Length);
+        context.Payload.CopyTo(response);
+        context.ResponseBytes = context.Payload.Length;
+    }
+
+    if (context.IsCompleted)
+    {
+        context.Connection.ShutdownWrite();
+    }
+}
+```
+
+This does not retain the receive bytes until the network write completes. The callback copies the bytes from the borrowed receive buffer into separate provider-owned output memory. When the callback returns:
+
+- the receive buffer can be reused unless it was retained;
+- the provider owns the output memory until the write completes;
+- the application does not wait for `OnWriteCompleted` unless it needs completion or error correlation.
+
+This path is not the expected ASP.NET Core request path because HTTP parsing, middleware, and application execution should not run on a provider worker.
+
+#### Retain, dispatch, process, and send
+
+The following simplified one-message-per-connection example moves processing to an application queue. It retains the original receive storage when possible and copies only when retention is unavailable:
+
+```csharp
+protected override void OnReceive(ref TransportReceiveContext context)
+{
+    if (context.Payload.IsEmpty)
+    {
+        if (context.IsCompleted)
+        {
+            context.Connection.ShutdownWrite();
+        }
+
+        return;
+    }
+
+    context.StopReceiving();
+
+    ReceivedRequest request;
+    if (context.TryRetainPayload(out TransportReceiveLease? lease))
+    {
+        request = ReceivedRequest.FromLease(context.Connection, lease);
+    }
+    else
+    {
+        request = ReceivedRequest.FromCopy(context.Connection, context.Payload.ToArray());
+    }
+
+    if (!_requests.Writer.TryWrite(request))
+    {
+        request.Dispose();
+        context.Connection.Abort(new InvalidOperationException("The application queue is full."));
+    }
+}
+
+private async Task ProcessRequestsAsync()
+{
+    await foreach (ReceivedRequest request in _requests.Reader.ReadAllAsync())
+    {
+        using (request)
+        {
+            byte[] response = await _handler(request.Buffer);
+
+            // Send copies before returning, so response does not need to remain alive
+            // until OnWriteCompleted.
+            request.Connection.Send(response);
+            request.Connection.ShutdownWrite();
+        }
+    }
+}
+```
+
+The lease is returned by `request.Dispose()` after `_handler` has finished reading `request.Buffer`. It is not tied to response completion. The response uses different outbound storage.
+
+If the response is already held in stable segmented memory, the application can avoid the copying `Send`:
+
+```csharp
+OutboundMessage message = await _handler.CreateMessageAsync(request.Buffer);
+request.Connection.SendBorrowed(message.Buffer, state: message);
+```
+
+The application must then release `message` only from terminal completion:
+
+```csharp
+protected override void OnWriteCompleted(ref TransportWriteCompletedContext context)
+{
+    if (context.Operation.State is OutboundMessage message)
+    {
+        message.Dispose();
+    }
+
+    if (context.Error is not null)
+    {
+        context.Connection.Abort(context.Error);
+    }
+}
+```
+
+The complete compilable shape of the first flow is in [`examples/DispatchedReceive.cs`](examples/DispatchedReceive.cs). It deliberately uses an abort-on-full bounded queue to keep the example small. A production protocol adapter should use byte-based thresholds and `TryPauseReceive`/`ResumeReceive`.
+
+#### ASP.NET Core through the Pipelines adapter
+
+ASP.NET Core application code does not retain a `TransportConnection` and does not implement `ITransportApplication`. The Pipelines adapter does both internally:
+
+```text
+provider OnReceive
+    -> adapter retains or copies the received bytes
+    -> adapter makes those bytes readable through TransportPipeConnection.Input
+    -> adapter schedules the PipeReader continuation
+    -> OnReceive returns
+
+Kestrel protocol loop
+    -> reads and parses TransportPipeConnection.Input
+    -> advances Input after request bytes are consumed
+       -> retained receive leases covering consumed bytes are disposed
+    -> dispatches the parsed request to middleware/application code
+
+application response
+    -> writes to TransportPipeConnection.Output
+    -> adapter send pump calls TransportConnection.SendBorrowed
+    -> internal OnWriteCompleted advances Output and permits its memory to be reused
+```
+
+Request input memory therefore remains alive until the protocol advances past it, not until the application produces a response. Parsed request metadata has its own lifetime, and request-body bytes remain only while the HTTP stack still exposes or buffers them. The response travels through an independent output pipe and independent outbound buffers.
 
 ### Close and failure callbacks
 

@@ -25,15 +25,17 @@ public sealed class EchoApplication : TransportApplication
 
     protected override void OnReceive(ref TransportReceiveContext context)
     {
+        if (!context.Payload.IsEmpty)
+        {
+            Span<byte> response = context.GetResponseSpan(context.Payload.Length);
+            context.Payload.CopyTo(response);
+            context.ResponseBytes = context.Payload.Length;
+        }
+
         if (context.IsCompleted)
         {
             context.Connection.ShutdownWrite();
-            return;
         }
-
-        Span<byte> response = context.GetResponseSpan(context.Payload.Length);
-        context.Payload.CopyTo(response);
-        context.ResponseBytes = context.Payload.Length;
     }
 
     protected override void OnWriteCompleted(ref TransportWriteCompletedContext context)
