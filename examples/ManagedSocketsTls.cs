@@ -29,6 +29,7 @@ public static class ManagedSocketsTls
                 Tls = ExampleTls.CreateServer(certificate),
             });
 
+        listener.Accept();
         Console.ReadLine();
     }
 

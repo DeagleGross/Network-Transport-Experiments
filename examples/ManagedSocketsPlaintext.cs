@@ -28,6 +28,7 @@ public static class ManagedSocketsPlaintext
                 NoDelay = true,
             });
 
+        listener.Accept();
         Console.ReadLine();
     }
 

@@ -39,6 +39,7 @@ public static class IoUringTls
                     TlsOffloadPolicy.Prefer),
             });
 
+        listener.Accept();
         Console.ReadLine();
     }
 

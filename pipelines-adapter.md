@@ -213,7 +213,13 @@ public sealed class TransportPipeListener : IAsyncDisposable
 }
 ```
 
-`AcceptAsync` returns `null` after normal listener shutdown. Accepted connections are queued in a bounded adapter queue. If the consumer does not accept fast enough, the adapter stops or rejects additional accepts according to listener policy rather than growing without limit.
+`AcceptAsync` returns `null` after normal listener shutdown. Each call registers one waiter and submits one low-level `TransportListener.Accept`, passing the waiter as operation state. No accept is submitted when there is no waiter.
+
+Cancellation calls `TransportAcceptOperation.Cancel`. If native acceptance already won the race, the adapter associates the accepted connection with the waiter and either completes it or aborts it when cancellation wins before delivery. A small bounded race queue may still be required for completions which cross cancellation, but it is not the normal waiting room for established connections.
+
+This preserves the listening socket's operating-system backlog as backpressure. Not posting an accept does not necessarily leave a SYN unanswered: the kernel can complete handshakes and queue established connections according to platform backlog policy. It does prevent the adapter from eagerly draining that queue into heap-allocated `TransportPipeConnection` objects before callers request them.
+
+When `OnAccepting` arrives, the adapter stores the waiter from `context.Operation.State` in `context.Connection.State`. `OnReady` completes that waiter. If TLS or connection setup fails after native acceptance but before readiness, `OnClosed` completes the same waiter with the terminal error.
 
 ### Pipe connection
 
@@ -747,15 +753,18 @@ Output backpressure remains the ordinary output `Pipe` threshold. The protocol's
 ### Accept
 
 ```text
-TransportListener accepts connection
+AcceptAsync creates waiter
+    -> TransportListener.Accept(waiter)
+    -> provider posts one native accept
+    -> operating-system backlog remains queued beyond that demand
+    -> TransportListener accepts one connection
     -> internal TransportApplication.OnAccepting
     -> TLS policy selected
     -> provider completes handshake
     -> OnReady
     -> adapter creates TransportPipeConnection
     -> adapter attaches direct receive sink when supported
-    -> connection enters listener accept queue
-    -> AcceptAsync completes
+    -> matching AcceptAsync waiter completes
 ```
 
 Receive delivery starts only after `OnReady` returns, so the adapter can install its receive strategy before application bytes arrive.
@@ -1089,18 +1098,19 @@ Diagnostics must identify the selected provider and actual path without exposing
 ## Acceptance criteria
 
 1. The same echo and framed-protocol tests pass using managed Socket, epoll, io_uring, and Windows providers.
-2. Direct epoll plaintext receive writes into pipe-owned memory without an intermediate transport-to-pipe copy.
-3. Fd-bound OpenSSL writes plaintext directly into pipe-owned memory and correctly handles `WANT_READ`, `WANT_WRITE`, buffered plaintext, clean TLS close, and fatal errors.
-4. io_uring retained buffers remain readable and unchanged until `AdvanceTo` releases their final visible segment.
-5. Copy fallback preserves identical `PipeReader` behavior.
-6. Input memory remains bounded under a slow consumer, including provider completions already in flight.
-7. Output pipe memory is not advanced or reused before terminal `OnWriteCompleted`, including zero-copy ownership notification.
-8. Protocol continuations do not run on provider workers unless inline scheduling is explicitly configured.
-9. Cancellation and abort cannot recycle direct destination memory while a native receive still references it.
-10. Connection and engine shutdown do not invalidate a previously returned input buffer before the consumer advances it.
-11. Final input before EOF remains observable.
-12. Graceful output completion drains bytes before TLS close notification and write shutdown.
-13. Benchmarks separately report direct, retained, and copied paths so fallback cannot look like a fast-path result.
+2. With no pending `AcceptAsync`, the adapter submits no native accept and creates no `TransportPipeConnection`; established peers remain subject to the operating-system listen backlog.
+3. Direct epoll plaintext receive writes into pipe-owned memory without an intermediate transport-to-pipe copy.
+4. Fd-bound OpenSSL writes plaintext directly into pipe-owned memory and correctly handles `WANT_READ`, `WANT_WRITE`, buffered plaintext, clean TLS close, and fatal errors.
+5. io_uring retained buffers remain readable and unchanged until `AdvanceTo` releases their final visible segment.
+6. Copy fallback preserves identical `PipeReader` behavior.
+7. Input memory remains bounded under a slow consumer, including provider completions already in flight.
+8. Output pipe memory is not advanced or reused before terminal `OnWriteCompleted`, including zero-copy ownership notification.
+9. Protocol continuations do not run on provider workers unless inline scheduling is explicitly configured.
+10. Cancellation and abort cannot recycle direct destination memory while a native receive still references it.
+11. Connection and engine shutdown do not invalidate a previously returned input buffer before the consumer advances it.
+12. Final input before EOF remains observable.
+13. Graceful output completion drains bytes before TLS close notification and write shutdown.
+14. Benchmarks separately report direct, retained, and copied paths so fallback cannot look like a fast-path result.
 
 ## Open questions
 

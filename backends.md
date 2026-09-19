@@ -86,7 +86,7 @@ Source basis: [runtime Socket and handle ownership](sources.md#s-runtime-sockets
 | Contract operation | Implementation |
 |---|---|
 | Listen | Create/bind/listen `Socket`, retain listener ownership |
-| Accept | `Socket.AcceptAsync(CancellationToken)` |
+| Accept | Each `TransportListener.Accept` starts one `Socket.AcceptAsync(CancellationToken)`; no accept runs without demand |
 | Connect | Synchronous core submission backed by `Socket.ConnectAsync(SocketAsyncEventArgs)`; completion maps to `OnReady` or `OnConnectFailed` |
 | Read | One pooled receive buffer plus `Socket.ReceiveAsync`; invoke `OnReceive` over the completed span |
 | Write | Provider-owned composition plus `Socket.SendAsync`; hide partial sends and raise one logical write-completion callback |
@@ -127,7 +127,7 @@ SocketSet's current epoll implementation is concrete evidence for this shape. It
 | Contract operation | epoll implementation |
 |---|---|
 | Listen | Nonblocking listener registered for read readiness; optionally one listener per shard with `SO_REUSEPORT` where policy permits |
-| Accept | Drain bounded `accept4` batch; assign connection generation and owner loop |
+| Accept | Consume only submitted accept operations; a readiness event may satisfy a bounded number no greater than current demand, using `accept4` and assigning connection generation/owner loop |
 | Connect | Nonblocking connect; writable readiness plus `SO_ERROR` determines completion |
 | Read | On read readiness, `recv` into provider memory; return one or more segments; stop at burst limit or `EAGAIN` |
 | Advance | Return consumed pool slots and re-enable read interest when backpressure clears |
@@ -183,7 +183,7 @@ On connection or engine shutdown, retained pages are removed from ring reuse bef
 
 | Contract operation | io_uring implementation |
 |---|---|
-| Listen | One-shot or multishot accept; `F_MORE` controls rearm; direct descriptors remain an optional implementation choice |
+| Listen | One-shot accept naturally maps to one submitted `TransportAcceptOperation`; multishot accept is allowed only if the provider can stop at zero demand and bound completions already in flight; direct descriptors remain an optional implementation choice |
 | Accept identity | CQE result provides accepted fd/direct descriptor; assign slot/generation before exposure |
 | Connect | One connect SQE; preserve endpoint storage until submission/required stable lifetime |
 | Read | Multishot recv/recvmsg with provided-buffer selection, or one-shot receive; queue CQE-selected buffers into connection order |
@@ -248,7 +248,7 @@ The proposal does not select the ambitious model by assumption. TLS 1.3 KeyUpdat
 These are explicit design questions, not invented answers:
 
 1. Does the provider use normal fds or io_uring direct descriptors, and how does that choice interact with OpenSSL socket BIOs?
-2. Is multishot accept used for every listener, and how are peer/local addresses obtained without unsafe shared address storage?
+2. Can multishot accept preserve exact application demand without draining the OS backlog, and how are peer/local addresses obtained without unsafe shared address storage? If not, use one-shot accepts.
 3. Does plaintext receive use multishot recv, multishot recvmsg, bundled receives, or a version-gated combination?
 4. How are CQE `user_data`, connection generation, and buffer ID encoded without truncation across architectures?
 5. Does each CQE produce one `OnReceive`, or can the provider batch several selected buffers into one callback and one retained multi-segment lease?

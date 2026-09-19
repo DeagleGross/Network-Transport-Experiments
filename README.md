@@ -251,18 +251,18 @@ flowchart LR
 - **Provider:** describes which backend to use and holds its provider-specific options. It is cheap and does not represent a running server.
 - **Engine:** the running instance created from the provider. It owns worker threads, rings or completion ports, buffer pools, listeners, and active connections.
 - **Application:** only the callback receiver registered with the engine. It is not the whole user application. The name is tentative; `TransportHandler` or `TransportCallbacks` may be clearer.
-- **Listener:** represents one bound endpoint. Disposing it stops new accepts without stopping the whole engine.
+- **Listener:** represents one bound endpoint. Each `Accept` call submits demand for one connection; disposing the listener stops new accepts without stopping the whole engine.
 - **Connect request:** identifies one outbound connection attempt so success, failure, or cancellation can be matched to the caller.
 - **Connection:** represents one accepted or connected TCP peer. The application uses it to send, pause/resume receiving, shut down, or abort. Incoming data arrives through the application callback.
 
-The small connect/write operation values in the proposed API are simply **receipts**. A connect receipt lets an adapter match `OnReady` or `OnConnectFailed` to the original connect call. A write receipt lets it match `OnWriteCompleted` to the original flush. They do not own threads or native resources.
+The small accept/connect/write operation values in the proposed API are simply **receipts**. An accept receipt lets an adapter match `OnAccepting` and `OnReady` to one pending `AcceptAsync`. A connect receipt lets it match `OnReady` or `OnConnectFailed` to the original connect call. A write receipt lets it match `OnWriteCompleted` to the original flush. They do not own threads or native resources.
 
 The contracts are intentionally layered:
 
 1. `TransportProvider` owns shared backend resources.
 2. `TransportListener` owns one bound listener.
 3. `TransportApplication` receives accept, ready, receive, write-completion, close, and provider callbacks.
-4. `TransportConnection` is stable connection identity, outbound writer, backpressure control, and metadata; it has no public read method.
+4. `TransportConnection` is a persistent heap-allocated connection identity, outbound writer, backpressure control, and metadata; it can be captured from `OnReady` and used later from application schedulers, and it has no public read method.
 5. TLS policy is selected before readiness and the provider drives the handshake, including ClientHello callbacks.
 6. Task, Stream, Pipelines, and Kestrel APIs are adapters above the callback core.
 
@@ -454,9 +454,11 @@ using TransportListener listener = engine.Listen(
         NoDelay = true,
         Tls = serverTls,
     });
+
+listener.Accept();
 ```
 
-The provider invokes `OnAccepting`, drives the selected TLS handshake, invokes `OnReady`, and then delivers `OnReceive` callbacks. A client calls synchronous `engine.Connect(options)` and receives success through `OnReady` or failure through `OnConnectFailed`; a higher-level adapter can turn that operation handle into `ConnectAsync`.
+`Listen` binds and starts listening but does not dequeue a connection. Each `listener.Accept()` submits demand for one accepted connection. The provider invokes `OnAccepting`, drives the selected TLS handshake, invokes `OnReady`, and then delivers `OnReceive` callbacks. A client calls synchronous `engine.Connect(options)` and receives success through `OnReady` or failure through `OnConnectFailed`; a higher-level adapter can turn that operation handle into `ConnectAsync`.
 
 For a Redis-style multiplexer, the provider is shared across many logical client connections. The protocol library owns request correlation, pooling, heartbeat, reconnect, and retry. The runtime transport owns only one physical connection, its I/O/TLS resources, and precise close/error notification. No throughput or latency advantage is asserted without measurements.
 

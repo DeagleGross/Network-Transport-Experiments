@@ -37,6 +37,7 @@ public static class WindowsRioTls
                 Tls = ExampleTls.CreateServer(certificate),
             });
 
+        listener.Accept();
         Console.ReadLine();
     }
 

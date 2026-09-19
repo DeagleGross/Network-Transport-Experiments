@@ -7,6 +7,7 @@ public sealed class EchoApplication : TransportApplication
     protected override void OnAccepting(ref TransportAcceptingContext context)
     {
         context.Connection.State = $"accepted:{context.Connection.Id}";
+        context.Listener.Accept();
     }
 
     protected override void OnReady(ref TransportReadyContext context)

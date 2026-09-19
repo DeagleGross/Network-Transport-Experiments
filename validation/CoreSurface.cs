@@ -161,7 +161,20 @@ public abstract class TransportListener : IDisposable
     public abstract IPEndPoint LocalEndPoint { get; }
     public abstract object? State { get; }
     public abstract bool IsAccepting { get; }
+    public abstract TransportAcceptOperation Accept(object? state = null);
     public abstract void Dispose();
+}
+
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public readonly struct TransportAcceptOperation : IEquatable<TransportAcceptOperation>
+{
+    public long Id { get; }
+    public object? State { get; }
+    public bool IsValid { get; }
+    public bool Cancel() => false;
+    public bool Equals(TransportAcceptOperation other) => Id == other.Id;
+    public override bool Equals(object? obj) => obj is TransportAcceptOperation other && Equals(other);
+    public override int GetHashCode() => Id.GetHashCode();
 }
 
 [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
@@ -263,6 +276,7 @@ public ref struct TransportAcceptingContext
 {
     public TransportListener Listener => throw new NotImplementedException();
     public TransportConnection Connection => throw new NotImplementedException();
+    public TransportAcceptOperation Operation { get; }
     public TransportServerTlsOptions? Tls { get; set; }
     public void Reject(Exception? error = null)
     {
@@ -275,6 +289,7 @@ public ref struct TransportReadyContext
     public TransportConnection Connection => throw new NotImplementedException();
     public TransportConnectionOrigin Origin { get; }
     public TransportListener? Listener => throw new NotImplementedException();
+    public TransportAcceptOperation AcceptOperation { get; }
     public TransportConnectOperation ConnectOperation { get; }
     public Span<byte> GetWriteSpan(int sizeHint = 0) => throw new NotImplementedException();
     public int WriteBytes { get; set; }

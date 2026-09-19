@@ -33,6 +33,7 @@ public static class WindowsIocpTls
                 Tls = ExampleTls.CreateServer(certificate),
             });
 
+        listener.Accept();
         Console.ReadLine();
     }
 

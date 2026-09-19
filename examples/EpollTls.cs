@@ -38,6 +38,7 @@ public static class EpollTls
                     TlsOffloadPolicy.Prefer),
             });
 
+        listener.Accept();
         Console.ReadLine();
     }
 

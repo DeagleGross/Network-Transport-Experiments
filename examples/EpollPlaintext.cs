@@ -34,6 +34,7 @@ public static class EpollPlaintext
                 EndPoint = new IPEndPoint(IPAddress.Any, 5000),
             });
 
+        listener.Accept();
         Console.ReadLine();
     }
 

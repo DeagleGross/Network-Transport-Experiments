@@ -118,6 +118,8 @@ using TransportListener listener = engine.Listen(new TransportListenOptions
 {
     EndPoint = new IPEndPoint(IPAddress.Any, 5000),
 });
+
+listener.Accept();
 ```
 
 Their roles are different:
@@ -165,14 +167,16 @@ For a server, creating the engine only starts the shared provider resources. It 
 2. create and bind the native listening socket;
 3. start listening with the requested backlog;
 4. register the listener with the selected provider worker or workers;
-5. arm the initial accept operations;
-6. return the persistent `TransportListener`.
+5. return the persistent `TransportListener`.
 
-At that point the server is accepting connections. The caller does not call `AcceptAsync` on the low-level listener. Accepted connections are delivered to the application registered with the engine:
+At that point the socket is listening, but the provider has not removed a connection from the operating-system accept queue. The caller submits accept demand through `listener.Accept()`. Each call permits one accepted connection to be delivered to the application registered with the engine:
 
 ```text
 engine.Listen(options)
     -> returns TransportListener
+
+listener.Accept()
+    -> returns TransportAcceptOperation
 
 remote client connects
     -> provider accepts TCP connection
@@ -205,7 +209,7 @@ await using TransportPipeListener listener = pipeEngine.Listen(options);
 TransportPipeConnection? connection = await listener.AcceptAsync();
 ```
 
-Internally, its engine-wide application receives `OnReady`, creates a `TransportPipeConnection`, and places it in the corresponding listener's accept queue.
+Internally, `AcceptAsync` creates one waiter and submits one low-level `listener.Accept(waiter)`. The engine-wide application receives `OnAccepting` and `OnReady`, correlates them through `TransportAcceptOperation.State`, creates a `TransportPipeConnection`, and completes that waiter. It does not continuously drain the operating-system accept queue into an application-side queue.
 
 The application is not a connection and does not mean that application business logic runs inside provider callbacks. It is the engine-wide callback receiver, usually implemented by an adapter:
 
@@ -230,6 +234,35 @@ protected override void OnReceive(ref TransportReceiveContext context)
 ```
 
 Disposing the engine stops callback production only after provider operations reach their required terminal state. The caller must keep the application alive until engine disposal returns. The application does not dispose the engine from inside a callback.
+
+`TransportConnection` is deliberately a heap-allocated persistent command object, not a callback-only view. An application normally captures it from `OnReady` in its own per-connection object or registry and can later send, pause, half-close, or abort because of a timer, server push, shutdown notification, completed database operation, or another connection:
+
+```csharp
+protected override void OnReady(ref TransportReadyContext context)
+{
+    var peer = new ServerPeer(context.Connection);
+    context.Connection.State = peer;
+    _peers.TryAdd(context.Connection.Id, peer);
+}
+
+public void Broadcast(ReadOnlySpan<byte> message)
+{
+    foreach (ServerPeer peer in _peers.Values)
+    {
+        peer.Send(message);
+    }
+}
+
+protected override void OnClosed(ref TransportClosedContext context)
+{
+    if (_peers.TryRemove(context.Connection.Id, out ServerPeer? peer))
+    {
+        peer.MarkClosed();
+    }
+}
+```
+
+The wrapper serializes same-direction writes for that connection. Calls made away from a provider callback are marshaled to the owning provider worker when necessary. `OnClosed` is the terminal callback: a command accepted before it receives its normal completion, while commands submitted after terminal close throw `ObjectDisposedException`. `Abort` remains idempotent.
 
 ### Provider selection
 
@@ -533,11 +566,36 @@ public abstract class TransportListener : IDisposable
     public abstract object? State { get; }
     public abstract bool IsAccepting { get; }
 
+    public abstract TransportAcceptOperation Accept(object? state = null);
+
     public abstract void Dispose();
+}
+
+[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
+public readonly struct TransportAcceptOperation :
+    IEquatable<TransportAcceptOperation>
+{
+    public long Id { get; }
+    public object? State { get; }
+    public bool IsValid { get; }
+
+    public bool Cancel();
 }
 ```
 
-`Listen` returns only after bind, listen, provider registration, and accept arming succeed. Disposing a listener:
+`Listen` returns only after bind, listen, and provider registration succeed. It does not submit an accept. `Accept` is a synchronous submission:
+
+- each call authorizes one native accept and returns a correlation handle;
+- providers do not dequeue more established connections than the number of outstanding accept operations;
+- several calls may be outstanding to configure accept concurrency;
+- `Cancel` requests cancellation while the native accept is still pending;
+- if acceptance wins the race, `OnAccepting` carries the operation and cancellation returns `false`;
+- a transient native wait remains provider-owned; a listener-wide fatal error closes the listener and fails all outstanding operations through `OnListenerClosed`;
+- calling `Accept` after listener disposal throws `ObjectDisposedException`.
+
+This preserves the operating-system listen backlog as the waiting room when the server has no accept demand. It does not imply that a SYN remains unanswered until `Accept`: TCP handshake and backlog behavior are operating-system-specific, and established connections may wait in the accept queue. The important distinction is that the runtime has not created and queued application connection objects for them.
+
+Disposing a listener:
 
 - stops new accepts;
 - waits for accept operations owned by that listener to reach terminal state;
@@ -600,6 +658,7 @@ public ref struct TransportAcceptingContext
 {
     public TransportListener Listener { get; }
     public TransportConnection Connection { get; }
+    public TransportAcceptOperation Operation { get; }
 
     public TransportServerTlsOptions? Tls { get; set; }
 
@@ -618,6 +677,7 @@ public ref struct TransportReadyContext
     public TransportConnection Connection { get; }
     public TransportConnectionOrigin Origin { get; }
     public TransportListener? Listener { get; }
+    public TransportAcceptOperation AcceptOperation { get; }
     public TransportConnectOperation ConnectOperation { get; }
 
     public Span<byte> GetWriteSpan(int sizeHint = 0);
@@ -627,18 +687,23 @@ public ref struct TransportReadyContext
 
 Lifecycle:
 
-1. TCP accept creates connection identity.
-2. `OnAccepting` runs before TLS.
-3. The callback may reject, change the preseeded TLS policy, or leave it plaintext.
-4. If TLS is selected, the provider drives the handshake and its registered ClientHello/options callbacks.
-5. `OnReady` runs only after plaintext selection or successful TLS authentication.
-6. `OnReceive` begins only after `OnReady` returns.
+1. `TransportListener.Accept` submits one accept operation.
+2. TCP accept creates connection identity and consumes that operation.
+3. `OnAccepting` runs before TLS and carries the operation.
+4. The callback may reject, change the preseeded TLS policy, or leave it plaintext.
+5. If TLS is selected, the provider drives the handshake and its registered ClientHello/options callbacks.
+6. `OnReady` runs only after plaintext selection or successful TLS authentication.
+7. `OnReceive` begins only after `OnReady` returns.
 
 For outbound connections, `OnReady` is raised after TCP connect and any configured TLS handshake.
+
+For an accepted connection, `AcceptOperation` is valid and `ConnectOperation` is default. For an outbound connection, `ConnectOperation` is valid and `AcceptOperation` is default.
 
 ### Connection API
 
 The connection has no read method. Receive belongs to the provider and is delivered through `OnReceive`.
+
+`TransportConnection` itself is a normal heap object. The callback contexts are stack-only because they contain borrowed memory, but `context.Connection` may be stored and used after the callback returns. It remains the application command handle until terminal `OnClosed`; retaining the managed object after that callback does not retain an active native connection.
 
 ```csharp
 [Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
@@ -1176,6 +1241,8 @@ using TransportListener listener = engine.Listen(new TransportListenOptions
     EndPoint = new IPEndPoint(IPAddress.Any, 8443),
     Tls = serverTls,
 });
+
+listener.Accept();
 ```
 
 Changing `IoUring` to `Epoll`, `WindowsIocp`, `WindowsRio`, or `ManagedSockets` changes provider construction and valid provider options, not connection callback code.
@@ -1208,6 +1275,7 @@ The core does not reject async programming. It moves async to adapters that have
 
 Examples:
 
+- a server adapter stores one waiter in `TransportAcceptOperation.State`, submits `listener.Accept(waiter)`, and completes it from `OnReady`;
 - a client adapter stores a `TaskCompletionSource` keyed by `TransportConnectOperation.Id` and completes it from `OnReady` or `OnConnectFailed`;
 - a write adapter stores a waiter keyed by `TransportWriteOperation.Id` and completes it from `OnWriteCompleted`;
 - a message transport can submit its existing reference-counted serialized sequence through `SendBorrowed` and release or reroute its logical messages after terminal completion;
@@ -1225,6 +1293,7 @@ The candidate adapter API is specified separately in [pipelines-adapter.md](pipe
 |---|---|
 | Portable and backend options share one bag | `TransportEngineOptions` contains only shared policy; each built-in provider has a typed options class |
 | Whole engine owns all listeners with no listener object | `TransportEngine.Listen` returns an independently disposable `TransportListener` |
+| Callback engine drains accepts without consumer demand | Each `TransportListener.Accept` authorizes one accepted connection and supplies correlation/cancellation |
 | `void Connect` has weak failure correlation | `TransportConnectOperation` identifies and cancels one attempt; completion callbacks carry it |
 | `OnClosed(Connection)` loses the error | `TransportClosedContext` carries phase, reason, and exception |
 | Public factory/shard/connection SPI exposes many mechanics | Built-in provider classes and native operation types stay internal; the public SPI is provider -> engine -> connection plus callback contexts |

@@ -192,11 +192,12 @@
 
 - Make `Listen` and `Connect` synchronous submissions.
 - Return an independently disposable listener.
+- Make accepted connections demand-driven: each listener `Accept` call submits one native accept and returns a cancelable correlation handle.
 - Keep engine disposal synchronous and deterministic in the low-level API.
 - Prohibit disposal from a provider callback.
 - Report the selected provider and resolved worker count.
 
-**Why:** Bind/start is control-plane setup and can fail before returning; an async method adds a state machine without improving the native lifetime. Listener disposal is a separate ownership boundary from engine disposal and accepted connections. Deterministic provider drain is valuable at shutdown, while hosts that cannot block can adapt disposal above this layer.
+**Why:** Bind/start is control-plane setup and can fail before returning; an async method adds a state machine without improving the native lifetime. Listener disposal is a separate ownership boundary from engine disposal and accepted connections. Demand-driven accept preserves the operating-system backlog as backpressure instead of eagerly converting queued connections into provider/application objects. Deterministic provider drain is valuable at shutdown, while hosts that cannot block can adapt disposal above this layer.
 
 ```diff
  namespace System.Net.Transport;
@@ -221,18 +222,29 @@
 +    public abstract IPEndPoint LocalEndPoint { get; }
 +    public abstract object? State { get; }
 +    public abstract bool IsAccepting { get; }
++    public abstract TransportAcceptOperation Accept(object? state = null);
 +    public abstract void Dispose();
++}
++
++[Experimental("SYSLIBXXXX", UrlFormat = "https://aka.ms/dotnet-warnings/{0}")]
++public readonly struct TransportAcceptOperation : IEquatable<TransportAcceptOperation>
++{
++    public long Id { get; }
++    public object? State { get; }
++    public bool IsValid { get; }
++    public bool Cancel();
 +}
 ```
 
-### Transport listen/connect options and TransportConnectOperation
+### Transport listen/connect options and operation handles
 
 - Keep listener and connect state on their own option types.
+- Return a value-type accept operation for demand, correlation, and cancellation.
 - Return a value-type connect operation for correlation and cancellation.
 - Use `RequiredWorkerIndex` only as an explicit low-level affinity request.
 - Keep TLS policy on listen/connect, with accepted connections able to override it in `OnAccepting`.
 
-**Why:** SocketSet's `UserToken` is useful but cannot identify a specific failed submission by itself. A small operation handle lets an adapter complete the correct waiter without putting Tasks into the core. Required worker placement serves a concrete proxy scenario; the name makes it clear that failure is preferable to silently losing affinity.
+**Why:** SocketSet's `UserToken` is useful but cannot identify a specific failed submission by itself. Small accept/connect operation handles let an adapter complete or cancel the correct waiter without putting Tasks into the core. Required worker placement serves a concrete proxy scenario; the name makes it clear that failure is preferable to silently losing affinity.
 
 ```diff
  namespace System.Net.Transport;
@@ -275,8 +287,9 @@
 - Keep receive pause/resume and explicit half-close/abort.
 - Do not expose raw handles or generic socket options.
 - Add an optional retained receive lease so protocol adapters can hold the exact provider buffer beyond `OnReceive` without exposing backend identities.
+- State explicitly that `TransportConnection` is a persistent heap object which can be retained and commanded after callbacks return.
 
-**Why:** This is the strongest distinction from `Socket`: the provider owns receive buffers and invokes the application at completion time. A task-based caller-buffer API would duplicate `Socket.ReceiveAsync` and weaken the case for a new surface. The write-operation handle fixes callback correlation while preserving an allocation-free core. `SendBorrowed` lets protocol libraries keep using their reference-counted serialized segments and permits provider-private scatter/gather or zero-copy paths without promising them. A bounded retained lease lets message-framing and Pipelines adapters preserve provider-selected receive memory after the callback instead of copying, while the provider still owns registration and reuse. Raw handles would permit a second I/O owner and break ordering or TLS framing.
+**Why:** This is the strongest distinction from `Socket`: the provider owns receive buffers and invokes the application at completion time. The stack-only context constrains borrowed bytes, not the connection lifetime. Serious servers require timer-driven writes, broadcasts, completed background operations, and administrative aborts, so the connection must be a persistent command object which marshals calls to its owning worker. A task-based caller-buffer API would duplicate `Socket.ReceiveAsync` and weaken the case for a new surface. The write-operation handle fixes callback correlation while preserving an allocation-free core. `SendBorrowed` lets protocol libraries keep using their reference-counted serialized segments and permits provider-private scatter/gather or zero-copy paths without promising them. A bounded retained lease lets message-framing and Pipelines adapters preserve provider-selected receive memory after the callback instead of copying, while the provider still owns registration and reuse. Raw handles would permit a second I/O owner and break ordering or TLS framing.
 
 ```diff
  namespace System.Net.Transport;
@@ -339,6 +352,7 @@
 +{
 +    public TransportListener Listener { get; }
 +    public TransportConnection Connection { get; }
++    public TransportAcceptOperation Operation { get; }
 +    public TransportServerTlsOptions? Tls { get; set; }
 +    public void Reject(Exception? error = null);
 +}
@@ -348,6 +362,7 @@
 +    public TransportConnection Connection { get; }
 +    public TransportConnectionOrigin Origin { get; }
 +    public TransportListener? Listener { get; }
++    public TransportAcceptOperation AcceptOperation { get; }
 +    public TransportConnectOperation ConnectOperation { get; }
 +    public Span<byte> GetWriteSpan(int sizeHint = 0);
 +    public int WriteBytes { get; set; }
