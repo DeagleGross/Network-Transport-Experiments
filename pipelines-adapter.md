@@ -524,6 +524,49 @@ RIO normally requires registered memory. A provider can expose a retained regist
 
 The adapter API does not claim that every provider uses the same path.
 
+## Comparison with current Kestrel receive memory
+
+Current plaintext `SocketConnection` already receives directly into userspace memory obtained from its input `PipeWriter`:
+
+```text
+PipeWriter.GetMemory
+    -> Socket.ReceiveAsync writes into that memory
+    -> PipeWriter.Advance
+    -> PipeWriter.FlushAsync
+    -> Kestrel reads through PipeReader
+    -> Kestrel calls AdvanceTo
+    -> consumed pipe memory may be reused
+```
+
+The kernel socket buffer is not exposed to Kestrel. `recv` or `Socket.ReceiveAsync` transfers bytes from the kernel into userspace pipe memory.
+
+An io_uring provided buffer is also userspace memory. It may be pinned, registered, or placed in a provided-buffer ring so the kernel can select it for an operation, but it does not become kernel-owned memory. The provider remains responsible for its allocation, registration, reuse, and eventual release.
+
+The retained io_uring path should have the same observable lifetime as current Kestrel pipe input:
+
+```text
+current Socket transport:
+    pipe block reusable after PipeReader.AdvanceTo passes it
+
+retained io_uring transport:
+    receive lease disposable after PipeReader.AdvanceTo passes it
+```
+
+For HTTP/1 request-line and header bytes, Kestrel normally parses and advances past the consumed bytes before executing the request handler. Those raw bytes therefore do not normally remain alive until the response is produced. Request-body bytes remain until the body consumer advances past them. If a receive segment also contains bytes for a later pipelined request, the segment remains until the consumed position passes those bytes.
+
+HTTPS has an additional ownership layer. The ordinary `SslStream` path consumes ciphertext from the transport and produces plaintext for HTTP parsing. The transport proposal similarly exposes only authenticated plaintext through `TransportPipeConnection.Input`; provider-internal ciphertext buffers have a separate lifetime.
+
+Retaining provided buffers is useful but more resource-sensitive than retaining ordinary interchangeable pipe blocks. A provider with a finite buffer ring must:
+
+- bound retained buffer count and bytes;
+- replenish or substitute buffers while retained buffers remain visible;
+- include retained bytes in input backpressure;
+- pause new application receives when capacity is exhausted;
+- copy into ordinary pipe memory when retention is unavailable and capacity permits;
+- release a lease immediately after the consumed position passes its final visible byte.
+
+The goal is not to retain receive buffers until request completion or response completion. The goal is to avoid an immediate adapter copy while preserving the ordinary `PipeReader.AdvanceTo` lifetime.
+
 ## Retained input reader
 
 An ordinary `PipeWriter` cannot adopt arbitrary completed read-only memory. The io_uring retention path therefore needs an adapter-owned `PipeReader` implementation or equivalent internal sequence queue.

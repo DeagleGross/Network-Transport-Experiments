@@ -286,6 +286,8 @@ An adapter that cannot consume synchronously can call `TryRetainPayload`. On suc
 
 The lease is intentionally storage-neutral. It does not expose an io_uring buffer ID, native address, writable memory, or a protocol-specific buffer such as Orleans `ArcBuffer`. A protocol library can parse the read-only sequence directly or wrap the lease in its own reference-counted segment/page owner. This permits the runtime provider to own registration, multishot receive, cancellation, and buffer-ring replenishment while the protocol library owns framing and the lifetime of bytes retained by messages.
 
+An io_uring provided buffer is userspace memory registered or provided to the kernel, not memory inside the kernel. Retention follows the same observable rule as current Kestrel input-pipe memory: release a segment when the `PipeReader` consumed position advances past its final byte. Parsed HTTP header bytes normally do not remain until handler or response completion; streaming body bytes remain until their consumer advances.
+
 Connection close and engine disposal do not invalidate outstanding leases. During shutdown, a provider detaches retained storage from reusable native pools and lets each lease release that storage independently. Engine disposal therefore does not wait forever for an application-held lease, and the application never observes freed memory through a still-live lease.
 
 ### Write
