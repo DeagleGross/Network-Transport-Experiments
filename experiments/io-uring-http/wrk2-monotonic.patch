@@ -1,0 +1,80 @@
+diff --git a/src/ae.c b/src/ae.c
+index 90be4e2..f21af1f 100644
+--- a/src/ae.c
++++ b/src/ae.c
+@@ -60,6 +60,15 @@
+     #endif
+ #endif
+ 
++static struct timespec monotonicTime(void) {
++    struct timespec now;
++    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
++        perror("clock_gettime");
++        abort();
++    }
++    return now;
++}
++
+ aeEventLoop *aeCreateEventLoop(int setsize) {
+     aeEventLoop *eventLoop;
+     int i;
+@@ -69,7 +78,7 @@ aeEventLoop *aeCreateEventLoop(int setsize) {
+     eventLoop->fired = zmalloc(sizeof(aeFiredEvent)*setsize);
+     if (eventLoop->events == NULL || eventLoop->fired == NULL) goto err;
+     eventLoop->setsize = setsize;
+-    eventLoop->lastTime = time(NULL);
++    eventLoop->lastTime = monotonicTime().tv_sec;
+     eventLoop->timeEventHead = NULL;
+     eventLoop->timeEventNextId = 0;
+     eventLoop->stop = 0;
+@@ -149,11 +158,9 @@ int aeGetFileEvents(aeEventLoop *eventLoop, int fd) {
+ 
+ static void aeGetTime(long *seconds, long *milliseconds)
+ {
+-    struct timeval tv;
+-
+-    gettimeofday(&tv, NULL);
++    struct timespec tv = monotonicTime();
+     *seconds = tv.tv_sec;
+-    *milliseconds = tv.tv_usec/1000;
++    *milliseconds = tv.tv_nsec/1000000;
+ }
+ 
+ static void aeAddMillisecondsToNow(long long milliseconds, long *sec, long *ms) {
+@@ -242,7 +249,7 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
+     int processed = 0;
+     aeTimeEvent *te;
+     long long maxId;
+-    time_t now = time(NULL);
++    time_t now = monotonicTime().tv_sec;
+ 
+     /* If the system clock is moved to the future, and then set back to the
+      * right value, time events may be delayed in a random way. Often this
+diff --git a/src/wrk.c b/src/wrk.c
+index 1049f0b..1bb2d3e 100644
+--- a/src/wrk.c
++++ b/src/wrk.c
+@@ -5,6 +5,7 @@
+ #include "main.h"
+ #include "hdr_histogram.h"
+ #include "stats.h"
++#include <time.h>
+ 
+ // Max recordable latency of 1 day
+ #define MAX_LATENCY 24L * 60 * 60 * 1000000
+@@ -673,9 +674,12 @@ static void socket_readable(aeEventLoop *loop, int fd, void *data, int mask) {
+ }
+ 
+ static uint64_t time_us() {
+-    struct timeval t;
+-    gettimeofday(&t, NULL);
+-    return (t.tv_sec * 1000000) + t.tv_usec;
++    struct timespec t;
++    if (clock_gettime(CLOCK_MONOTONIC, &t) != 0) {
++        perror("clock_gettime");
++        abort();
++    }
++    return ((uint64_t)t.tv_sec * 1000000) + t.tv_nsec / 1000;
+ }
+ 
+ static char *copy_url_part(char *url, struct http_parser_url *parts, enum http_parser_url_fields field) {

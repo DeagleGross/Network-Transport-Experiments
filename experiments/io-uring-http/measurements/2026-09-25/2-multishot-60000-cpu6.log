@@ -1,0 +1,2 @@
+READY mode=multishot pid=10220 port=18204
+STATS accepted=435846 responses=435687 recv_submissions=435846 recv_cqes=871533 cancels=435687 errors=0

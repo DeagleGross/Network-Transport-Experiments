@@ -1,0 +1,7 @@
+*.c text eol=lf
+*.h text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+Makefile text eol=lf
+wrk2-monotonic.patch -whitespace
+measurements/** -whitespace

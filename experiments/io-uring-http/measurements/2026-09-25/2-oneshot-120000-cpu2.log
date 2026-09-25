@@ -1,0 +1,2 @@
+READY mode=oneshot pid=10496 port=18207
+STATS accepted=487094 responses=486993 recv_submissions=487094 recv_cqes=487094 cancels=0 errors=0
