@@ -12,6 +12,7 @@
 - [Pipelines adapter proposal](pipelines-adapter.md)
 - [Provider usage examples](examples/README.md)
 - [Runnable C io_uring experiment: one-shot versus multishot](experiments/io-uring-http/README.md)
+- [Transport and TLS implementation patterns across runtimes](transport-framework-comparison.md)
 - [SocketSet public API and layer map](socketset-public-api-map.md)
 - [TLS option and callback parity](tls.md)
 - [Backend mappings and primers](backends.md)
